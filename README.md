@@ -7,7 +7,7 @@ A dark-themed dashboard for managing AI agents, tasks, cron jobs, memory logs, a
 ### 1. Clone the canonical checkout and install
 
 ```bash
-git clone https://github.com/openclaw-io/aipaths-mission-control.git /Users/joaco/openclaw/repos/aipaths-mission-control-live
+git clone https://github.com/aipaths/aipaths-mission-control.git /Users/joaco/openclaw/repos/aipaths-mission-control-live
 cd /Users/joaco/openclaw/repos/aipaths-mission-control-live
 npm install
 ```
