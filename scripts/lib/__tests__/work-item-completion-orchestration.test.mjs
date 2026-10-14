@@ -242,7 +242,7 @@ test("email_draft completion stores the draft and moves email_campaign to ready_
     const emailDraft = {
       subject: "Nuevo video de AIPaths",
       preview_text: "Una forma práctica de operar con IA",
-      body_markdown: "Mirá el nuevo video.",
+      body_markdown: "Mirá el nuevo video: https://youtu.be/abc y https://aipaths.academy/diagnostico?ref=email-video-abc-2026-10-14",
     };
 
     await orchestrateWorkItemCompletion(client, {
@@ -256,6 +256,37 @@ test("email_draft completion stores the draft and moves email_campaign to ready_
     assert.equal(row.status, "ready_for_review");
     assert.deepEqual(row.metadata.draft, emailDraft);
     assert.equal(row.metadata.review.status, "ready_for_review");
+  });
+});
+
+test("email_draft completion rejects a draft whose only link is YouTube", async () => {
+  await inRollbackTransaction(async (client) => {
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "email_campaign",
+      status: "drafting",
+      metadata: { kind: "video_announcement" },
+    });
+    const workItem = await insertWorkItem(client, pipelineItem, {
+      relation_type: "marketing_email_campaign",
+      action: "draft_video_announcement",
+    });
+    for (const body_markdown of [
+      "Mirá el video: https://www.youtube.com/watch?v=abc",
+      "Sitio sin ref: https://aipaths.academy/diagnostico y https://youtu.be/abc",
+      "Ref ajeno: https://aipaths.academy/diagnostico?ref=youtube-abc",
+    ]) {
+      await assert.rejects(
+        orchestrateWorkItemCompletion(client, {
+          existing: workItem,
+          updated: completed(workItem),
+          body: { status: "done", output: { email_draft: { subject: "s", preview_text: "p", body_markdown } } },
+          verifyPublishedContent,
+        }),
+        /email_draft_missing_site_cta_ref/,
+      );
+    }
+    const row = (await client.query("select status from public.pipeline_items where id = $1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "drafting");
   });
 });
 
