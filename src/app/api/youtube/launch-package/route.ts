@@ -49,7 +49,7 @@ export async function GET() {
       title: "Cómo construí un equipo usando IA",
       playlist_context_url: "https://www.youtube.com/watch?v=Dn1pJz5fq-w&list=PLAYLIST_ID",
       target_email_send_at: "Optional ISO date; defaults to publish_at+3h",
-      email_tracking_ref: "Optional; defaults to email-youtube-<video_id>",
+      email_tracking_ref: "Optional; defaults to email-video-<video_id>-YYYY-MM-DD",
       optional_diagnostic_cta: "Optional diagnostic CTA URL for Marketing context",
       refs: { optional: "Any reference links/context Strategist wants preserved" },
     },

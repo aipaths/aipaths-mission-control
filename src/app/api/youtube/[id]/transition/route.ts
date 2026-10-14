@@ -204,6 +204,7 @@ function createVideoAnnouncementEmailInstruction(input: {
     "Task:",
     "- Draft a Spanish email announcement for this newly published AIPaths YouTube video.",
     "- Focus on the problem/idea from the video, why subscribers should care, and a clear CTA to watch it.",
+    "- REQUIRED: body_markdown must also include a CTA link to https://aipaths.academy with a ref starting with `email-` (canonical: `email-video-<slug>-YYYY-MM-DD`). The YouTube link carries no ref and cannot be the only CTA; drafts without it are rejected.",
     "- Do not send or schedule the email.",
     "- Complete this work item with output.email_draft containing: subject, preview_text, body_markdown.",
     "- Mission Control will move the email card to ready_for_review after completion.",
