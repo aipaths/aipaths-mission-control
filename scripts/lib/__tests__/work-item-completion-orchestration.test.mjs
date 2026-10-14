@@ -13,6 +13,10 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const completionSource = resolve(repoRoot, "src/lib/work-items/completion-orchestration.ts");
 const agentCompletionSource = resolve(repoRoot, "src/lib/work-items/agent-completion-local.ts");
 const youtubeSource = resolve(repoRoot, "src/lib/youtube-pipeline.ts");
+const youtubeLaunchSource = resolve(repoRoot, "src/lib/youtube-launch-package.ts");
+const youtubeLaunchStateSource = resolve(repoRoot, "src/lib/youtube-launch-state.ts");
+const externalDeliverySource = resolve(repoRoot, "src/lib/work-items/external-delivery.ts");
+const scheduledLaunchRuntimeSource = resolve(repoRoot, "src/lib/work-items/scheduled-launch-runtime.ts");
 
 function transpileModule(sourcePath, requires = {}) {
   const source = readFileSync(sourcePath, "utf8");
@@ -38,17 +42,30 @@ function transpileModule(sourcePath, requires = {}) {
     JSON,
     String,
     RegExp,
+    URL,
     Object,
     Array,
     Math,
+    URL,
   };
   vm.runInNewContext(transpiled, sandbox, { filename: sourcePath });
   return cjsModule.exports;
 }
 
 const youtubePipeline = transpileModule(youtubeSource);
+const youtubeLaunchPackage = transpileModule(youtubeLaunchSource, {
+  "node:crypto": { randomUUID },
+  "@supabase/supabase-js": {},
+});
+const youtubeLaunchState = transpileModule(youtubeLaunchStateSource);
+const externalDelivery = transpileModule(externalDeliverySource);
+const scheduledLaunchRuntime = transpileModule(scheduledLaunchRuntimeSource);
 const { orchestrateWorkItemCompletion, buildPublicationVerificationRequest } = transpileModule(completionSource, {
   "@/lib/youtube-pipeline": youtubePipeline,
+  "@/lib/youtube-launch-package": youtubeLaunchPackage,
+  "@/lib/youtube-launch-state": youtubeLaunchState,
+  "@/lib/work-items/external-delivery": externalDelivery,
+  "@/lib/work-items/scheduled-launch-runtime": scheduledLaunchRuntime,
   "@/lib/work-items/git-artifact": {
     verifyRepositoryCommit: async (repositoryPath, sha) => ({ repositoryPath, repositoryRoot: repositoryPath, sha }),
   },
@@ -138,6 +155,24 @@ async function insertPipelineItem(client, overrides = {}) {
   return result.rows[0];
 }
 
+async function insertApprovedLaunchChildren(client, parentId, launchGeneration, publishAt) {
+  for (const pipelineType of ["community_post", "email_campaign", "youtube_pinned_comment"]) {
+    await insertPipelineItem(client, {
+      pipeline_type: pipelineType,
+      status: "ready_for_review",
+      metadata: {
+        launch_package: {
+          kind: "scheduled_youtube_launch_package_v1",
+          source_video_pipeline_item_id: parentId,
+          launch_generation: launchGeneration,
+          publish_at: publishAt,
+        },
+        review: { status: "approved", approved_by: "gonza", launch_generation: launchGeneration },
+      },
+    });
+  }
+}
+
 async function insertWorkItem(client, pipelineItem, payloadOverrides = {}) {
   const id = randomUUID();
   const payload = {
@@ -156,6 +191,40 @@ async function insertWorkItem(client, pipelineItem, payloadOverrides = {}) {
     [id, pipelineItem.id, `Complete ${pipelineItem.title}`, payloadOverrides.owner_agent || "test", JSON.stringify(payload)],
   );
   return result.rows[0];
+}
+
+async function insertScheduledActivation(client, pipelineItem, { videoId, publishAt = "2026-08-01T10:00:00.000Z" }) {
+  const launchGeneration = `youtube-launch-v1:${videoId}:${publishAt}`;
+  const workItem = await insertWorkItem(client, pipelineItem, {
+    trigger: "youtube_launch_package_v1",
+    relation_type: "video_launch_activate",
+    action: "video_launch_activate",
+    source_video_pipeline_item_id: pipelineItem.id,
+    pipeline_item_id: pipelineItem.id,
+    video_id: videoId,
+    publish_at: publishAt,
+    launch_generation: launchGeneration,
+  });
+  const metadata = {
+    ...(pipelineItem.metadata || {}),
+    youtube_v0: { ...((pipelineItem.metadata || {}).youtube_v0 || {}), video_id: videoId },
+    launch_package: {
+      ...((pipelineItem.metadata || {}).launch_package || {}),
+      kind: "scheduled_youtube_launch_package_v1",
+      status: "scheduled",
+      video_id: videoId,
+      publish_at: publishAt,
+      launch_generation: launchGeneration,
+      activation_work_item_id: workItem.id,
+      preflight: { status: "pass", checked_at: new Date(Date.now() - 120_000).toISOString() },
+    },
+  };
+  await client.query("update public.pipeline_items set metadata=$1::jsonb where id=$2", [JSON.stringify(metadata), pipelineItem.id]);
+  await client.query(
+    "insert into public.pipeline_work_map (pipeline_item_id, work_item_id, relation_type) values ($1,$2,'followup')",
+    [pipelineItem.id, workItem.id],
+  );
+  return { workItem, launchGeneration };
 }
 
 function completed(workItem) {
@@ -186,6 +255,72 @@ test("community completion persists output copy and moves the pipeline card to r
     const row = (await client.query("select status, metadata from public.pipeline_items where id = $1", [pipelineItem.id])).rows[0];
     assert.equal(row.status, "ready_for_review");
     assert.equal(row.metadata.copy.text, "Copy final para Discord");
+    assert.equal(row.metadata.runtime_feedback.last_status, "copy_saved");
+  });
+});
+
+test("community video launch completion stays draft when playlist URL is missing", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "Dn1pJz5fq-w";
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const pipelineItem = await insertPipelineItem(client, {
+      metadata: {
+        kind: "video_launch_announcement",
+        source: { video_id: videoId, video_url: watchUrl, playlist_context_url: null },
+        launch_package: {
+          video_id: videoId,
+          youtube_url: watchUrl,
+          playlist_context_url: null,
+          suppress_link_previews: false,
+        },
+        copy: { text: "" },
+      },
+    });
+    const workItem = await insertWorkItem(client, pipelineItem);
+
+    await orchestrateWorkItemCompletion(client, {
+      existing: workItem,
+      updated: completed(workItem),
+      body: { status: "done", output: { copy: { text: `Nuevo video\n${watchUrl}` } } },
+      verifyPublishedContent,
+    });
+
+    const row = (await client.query("select status, metadata from public.pipeline_items where id = $1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "draft");
+    assert.match(row.metadata.review.notes, /playlist_context_url.*required/i);
+    assert.equal(row.metadata.runtime_feedback.last_status, "launch_validation_failed");
+  });
+});
+
+test("community video launch completion reaches review with matching raw playlist URL", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "Dn1pJz5fq-w";
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const playlistContextUrl = `${watchUrl}&list=PLabc123`;
+    const pipelineItem = await insertPipelineItem(client, {
+      metadata: {
+        kind: "video_launch_announcement",
+        source: { video_id: videoId, video_url: watchUrl, playlist_context_url: playlistContextUrl },
+        launch_package: {
+          video_id: videoId,
+          youtube_url: watchUrl,
+          playlist_context_url: playlistContextUrl,
+          suppress_link_previews: false,
+        },
+        copy: { text: "" },
+      },
+    });
+    const workItem = await insertWorkItem(client, pipelineItem);
+
+    await orchestrateWorkItemCompletion(client, {
+      existing: workItem,
+      updated: completed(workItem),
+      body: { status: "done", output: { copy: { text: `Nuevo video\n${playlistContextUrl}` } } },
+      verifyPublishedContent,
+    });
+
+    const row = (await client.query("select status, metadata from public.pipeline_items where id = $1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "ready_for_review");
     assert.equal(row.metadata.runtime_feedback.last_status, "copy_saved");
   });
 });
@@ -256,6 +391,35 @@ test("email_draft completion stores the draft and moves email_campaign to ready_
     assert.equal(row.status, "ready_for_review");
     assert.deepEqual(row.metadata.draft, emailDraft);
     assert.equal(row.metadata.review.status, "ready_for_review");
+  });
+});
+
+test("YouTube pinned comment draft completion stores text and moves to ready_for_review", async () => {
+  await inRollbackTransaction(async (client) => {
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "youtube_pinned_comment",
+      status: "drafting",
+      metadata: { draft: {}, launch_package: { video_id: "PinDraft001" } },
+    });
+    const workItem = await insertWorkItem(client, pipelineItem, {
+      relation_type: "youtube_pinned_comment_draft",
+      action: "draft_youtube_pinned_comment",
+      owner_agent: "youtube",
+    });
+    const pinnedDraft = { text: "Comentá 'IA' y te paso el recurso.", status: "ready_for_review" };
+
+    await orchestrateWorkItemCompletion(client, {
+      existing: workItem,
+      updated: completed(workItem),
+      body: { status: "done", output: { pinned_comment_draft: pinnedDraft } },
+      verifyPublishedContent,
+    });
+
+    const row = (await client.query("select status, metadata from public.pipeline_items where id = $1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "ready_for_review");
+    assert.equal(row.metadata.draft.text, pinnedDraft.text);
+    assert.equal(row.metadata.review.status, "ready_for_review");
+    assert.equal(row.metadata.runtime_feedback.last_status, "pinned_comment_draft_saved");
   });
 });
 
@@ -462,4 +626,567 @@ test("agent completion rolls the work item and pipeline effects back together wh
     await pool.query("delete from public.work_items where id = $1", [workItemId]);
     await pool.query("delete from public.pipeline_items where id = $1", [pipelineId]);
   }
+});
+
+test("agent endpoint rejects YouTube launch identity payload mutations before update", async () => {
+  const pipelineId = randomUUID();
+  const workItemId = randomUUID();
+  await pool.query(
+    "insert into public.pipeline_items (id,pipeline_type,title,status,metadata) values ($1,'video','Launch identity guard','scheduled','{}'::jsonb)",
+    [pipelineId],
+  );
+  await pool.query(
+    `insert into public.work_items
+       (id,kind,source_type,source_id,title,instruction,status,owner_agent,target_agent_id,payload)
+     values ($1,'task','pipeline_item',$2,'Activation guard','test','in_progress','strategist','strategist',$3::jsonb)`,
+    [workItemId, pipelineId, JSON.stringify({
+      trigger: "youtube_launch_package_v1",
+      action: "video_launch_activate",
+      relation_type: "video_launch_activate",
+      pipeline_item_id: pipelineId,
+      source_video_pipeline_item_id: pipelineId,
+      launch_generation: "generation-1",
+      publish_at: "2026-08-01T10:00:00.000Z",
+    })],
+  );
+  try {
+    await assert.rejects(
+      () => agentCompletion.patchAgentWorkItemWithCompletion(workItemId, {
+        status: "ready",
+        payload_patch: { action: "develop_community_post", source_video_pipeline_item_id: randomUUID() },
+      }),
+      /youtube_launch_controlled_payload_mutation/,
+    );
+    const row = (await pool.query("select status,payload from public.work_items where id=$1", [workItemId])).rows[0];
+    assert.equal(row.status, "in_progress");
+    assert.equal(row.payload.action, "video_launch_activate");
+    assert.equal(row.payload.source_video_pipeline_item_id, pipelineId);
+  } finally {
+    await pool.query("delete from public.work_items where id=$1", [workItemId]);
+    await pool.query("delete from public.pipeline_items where id=$1", [pipelineId]);
+  }
+});
+
+test("agent endpoint rejects every Scheduled Launch V2 identity, gate, retry and delivery mutation on derived external actions", async () => {
+  const pipelineId = randomUUID();
+  const controlled = {
+    launch_state_contract: "attacker_contract",
+    requires_preflight_passed: false,
+    requires_live_check_passed: false,
+    requires_gonza_approval: false,
+    approval_status: "approved",
+    runtime_retry_contract: "attacker_retry",
+    external_delivery_idempotency_key: "attacker-key",
+  };
+  await pool.query(
+    "insert into public.pipeline_items (id,pipeline_type,title,status,metadata) values ($1,'community_post','Derived launch guard','scheduled','{}'::jsonb)",
+    [pipelineId],
+  );
+  try {
+    for (const mutationField of ["payload_patch", "payload_increment"]) {
+      const workItemId = randomUUID();
+      await pool.query(
+        `insert into public.work_items
+           (id,kind,source_type,source_id,title,instruction,status,owner_agent,target_agent_id,payload)
+         values ($1,'task','pipeline_item',$2,'Derived community publish','test','in_progress','community','community',$3::jsonb)`,
+        [workItemId, pipelineId, JSON.stringify({
+          trigger: "community_review_approved_scheduled",
+          action: "publish_community_post",
+          relation_type: "publish_community_post",
+          pipeline_item_id: pipelineId,
+          source_video_pipeline_item_id: randomUUID(),
+          launch_state_contract: "scheduled_launch_v2",
+          launch_generation: "generation-authoritative",
+          publish_at: "2026-08-01T10:00:00.000Z",
+          requires_preflight_passed: true,
+          requires_live_check_passed: true,
+          requires_gonza_approval: true,
+          approval_status: "pending",
+          runtime_retry_contract: "scheduled_launch_v2_retry_v1",
+          external_delivery_idempotency_key: "ytlaunch:fixture:authoritative",
+        })],
+      );
+      try {
+        await assert.rejects(
+          () => agentCompletion.patchAgentWorkItemWithCompletion(workItemId, {
+            status: "ready",
+            [mutationField]: controlled,
+          }),
+          /youtube_launch_controlled_payload_mutation/,
+        );
+        const row = (await pool.query("select status,payload from public.work_items where id=$1", [workItemId])).rows[0];
+        assert.equal(row.status, "in_progress");
+        for (const key of Object.keys(controlled)) assert.notEqual(row.payload[key], controlled[key]);
+      } finally {
+        await pool.query("delete from public.work_items where id=$1", [workItemId]);
+      }
+    }
+  } finally {
+    await pool.query("delete from public.pipeline_items where id=$1", [pipelineId]);
+  }
+});
+
+test("YouTube launch preflight completion persists pass evidence on the scheduled parent", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "Preflight01";
+    const checkedAt = new Date().toISOString();
+    const publishAt = new Date(Date.now() + 29 * 60_000).toISOString();
+    const launchGeneration = `youtube-launch-v1:${videoId}:${publishAt}:fixture`;
+    const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: publishAt,
+      metadata: {
+        youtube_v0: { stage: "scheduled", video_id: videoId, playlist_id: "PLabc123" },
+        launch_package: {
+          kind: "scheduled_youtube_launch_package_v1",
+          status: "scheduled",
+          video_id: videoId,
+          youtube_url: publicUrl,
+          playlist_id: "PLabc123",
+          publish_at: publishAt,
+          launch_generation: launchGeneration,
+        },
+      },
+    });
+    await insertApprovedLaunchChildren(client, pipelineItem.id, launchGeneration, publishAt);
+    const workItem = await insertWorkItem(client, pipelineItem, {
+      trigger: "youtube_launch_package_v1",
+      relation_type: "youtube_launch_preflight",
+      action: "youtube_launch_preflight",
+      source_video_pipeline_item_id: pipelineItem.id,
+      pipeline_item_id: pipelineItem.id,
+      video_id: videoId,
+      publish_at: publishAt,
+      launch_generation: launchGeneration,
+    });
+
+    const result = await orchestrateWorkItemCompletion(client, {
+      existing: workItem,
+      updated: completed(workItem),
+      body: { status: "done", output: { preflight: {
+        status: "pass",
+        checked_at: checkedAt,
+        evidence: {
+          video_id: videoId,
+          canonical_url: publicUrl,
+          privacy_status: "private",
+          scheduled_publish_at: publishAt,
+          playlist: { playlist_id: "PLabc123", contains_video: true },
+          approvals: {
+            community: { status: "approved" },
+            marketing: { status: "approved" },
+            pinned_comment: { status: "manual_out_of_scope", manual_out_of_scope: true },
+          },
+          runtime_health: { status: "healthy" },
+          summary: "Preflight passed",
+        },
+      } } },
+      verifyPublishedContent,
+    });
+
+    assert.equal(result.effect, "youtube_launch_preflight_passed");
+    const row = (await client.query("select status, metadata from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "scheduled");
+    assert.equal(row.metadata.launch_package.launch_state, "scheduled");
+    assert.equal(row.metadata.launch_package.preflight.status, "pass");
+    assert.equal(row.metadata.runtime_feedback.last_status, "youtube_launch_preflight_passed");
+  });
+});
+
+test("blocked preflight is recoverable through remediation, requeue and a passing rerun", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "Preflight02";
+    const checkedAt = new Date().toISOString();
+    const publishAt = new Date(Date.now() + 29 * 60_000).toISOString();
+    const launchGeneration = `youtube-launch-v1:${videoId}:${publishAt}:fixture`;
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: publishAt,
+      metadata: {
+        youtube_v0: { stage: "scheduled", video_id: videoId, playlist_id: "PLabc123" },
+        launch_package: {
+          kind: "scheduled_youtube_launch_package_v1",
+          status: "scheduled",
+          video_id: videoId,
+          youtube_url: `https://www.youtube.com/watch?v=${videoId}`,
+          playlist_id: "PLabc123",
+          publish_at: publishAt,
+          launch_generation: launchGeneration,
+        },
+      },
+    });
+    const workItem = await insertWorkItem(client, pipelineItem, {
+      trigger: "youtube_launch_package_v1",
+      launch_state_contract: "scheduled_launch_v2",
+      relation_type: "youtube_launch_preflight",
+      action: "youtube_launch_preflight",
+      source_video_pipeline_item_id: pipelineItem.id,
+      pipeline_item_id: pipelineItem.id,
+      video_id: videoId,
+      publish_at: publishAt,
+      launch_generation: launchGeneration,
+    });
+    await client.query("update work_items set status='done',completed_at=now() where id=$1", [workItem.id]);
+
+    const blockedBody = { status: "done", output: { preflight: {
+      status: "blocked",
+      checked_at: checkedAt,
+      blockers: ["thumbnail_not_ready"],
+      approvals: {
+        community: { status: "approved" },
+        marketing: { status: "approved" },
+        pinned_comment: { status: "manual_out_of_scope" },
+      },
+      evidence: { video_id: videoId },
+    } } };
+    const blockedResult = await orchestrateWorkItemCompletion(client, {
+      existing: workItem,
+      updated: completed(workItem),
+      body: blockedBody,
+      verifyPublishedContent,
+    });
+
+    assert.equal(blockedResult.effect, "youtube_launch_preflight_blocked");
+    const blockedWork = (await client.query("select status,completed_at,payload from work_items where id=$1", [workItem.id])).rows[0];
+    assert.equal(blockedWork.status, "blocked");
+    assert.equal(blockedWork.completed_at, null);
+    assert.equal(blockedWork.payload.dispatch_state, "blocked_launch_gate");
+    assert.match(blockedWork.payload.remediation, /rerun.*preflight/i);
+    assert.equal(blockedWork.payload.dead_letter_reason, "youtube_launch_preflight_blocked");
+
+    await insertApprovedLaunchChildren(client, pipelineItem.id, launchGeneration, publishAt);
+    await client.query(
+      `update work_items set status='ready',completed_at=null,
+         payload=payload || '{"dispatch_state":"ready_after_manual_requeue"}'::jsonb where id=$1`,
+      [workItem.id],
+    );
+    const requeued = (await client.query("select * from work_items where id=$1", [workItem.id])).rows[0];
+    await client.query("update work_items set status='done',completed_at=now() where id=$1", [workItem.id]);
+    const passBody = { status: "done", output: { preflight: {
+      status: "pass",
+      checked_at: checkedAt,
+      evidence: {
+        video_id: videoId,
+        canonical_url: `https://www.youtube.com/watch?v=${videoId}`,
+        privacy_status: "private",
+        scheduled_publish_at: publishAt,
+        playlist: { playlist_id: "PLabc123", contains_video: true },
+        runtime_health: { status: "healthy" },
+      },
+    } } };
+    const passedResult = await orchestrateWorkItemCompletion(client, {
+      existing: requeued,
+      updated: completed(requeued),
+      body: passBody,
+      verifyPublishedContent,
+    });
+
+    assert.equal(passedResult.effect, "youtube_launch_preflight_passed");
+    const passedWork = (await client.query("select status from work_items where id=$1", [workItem.id])).rows[0];
+    const parent = (await client.query("select status,published_at,current_url,metadata from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(passedWork.status, "done");
+    assert.equal(parent.status, "scheduled");
+    assert.equal(parent.published_at, null);
+    assert.equal(parent.current_url, null);
+    assert.equal(parent.metadata.launch_package.launch_state, "scheduled");
+    assert.equal(parent.metadata.launch_package.preflight.status, "pass");
+  });
+});
+
+test("YouTube live-check publishes the exact scheduled parent once with public evidence", async () => {
+  await inRollbackTransaction(async (client) => {
+    const publishAt = new Date(Date.now() - 60_000).toISOString();
+    const checkedAt = new Date(Date.now() - 30_000).toISOString();
+    const publicUrl = "https://www.youtube.com/watch?v=LiveCheck01";
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: publishAt,
+      metadata: {
+        youtube_v0: { stage: "scheduled", video_id: "LiveCheck01" },
+        launch_package: { kind: "scheduled_youtube_launch_package_v1", status: "scheduled" },
+      },
+    });
+    const { workItem, launchGeneration } = await insertScheduledActivation(client, pipelineItem, { videoId: "LiveCheck01", publishAt });
+    const body = { status: "done", output: { live_check: {
+      status: "public",
+      checked_at: checkedAt,
+      public_url: publicUrl,
+      launch_generation: launchGeneration,
+      evidence: { source: "youtube_data_api", video_id: "LiveCheck01", visibility: "public", public_url: publicUrl },
+    } } };
+
+    const first = await orchestrateWorkItemCompletion(client, {
+      existing: workItem, updated: completed(workItem), body, verifyPublishedContent,
+    });
+    const second = await orchestrateWorkItemCompletion(client, {
+      existing: completed(workItem), updated: completed(workItem), body, verifyPublishedContent,
+    });
+
+    assert.equal(first.effect, "youtube_launch_activated");
+    assert.equal(second.applied, false);
+    const row = (await client.query("select status, published_at, current_url, metadata from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "published");
+    assert.equal(row.current_url, publicUrl);
+    assert.ok(row.published_at);
+    assert.equal(row.metadata.youtube_v0.stage, "published");
+    assert.equal(row.metadata.launch_package.status, "activated");
+    assert.equal(row.metadata.launch_package.public_verified, true);
+
+    const fanout = await client.query(
+      `select id from work_items
+        where source_id=$1
+          and (payload->>'trigger'='video_published_manual'
+            or payload->>'action' in ('draft_video_announcement','collect_youtube_snapshot'))`,
+      [pipelineItem.id],
+    );
+    assert.equal(fanout.rowCount, 0);
+  });
+});
+
+test("YouTube live-check cannot activate early with future evidence", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "EarlyGate01";
+    const publishAt = new Date(Date.now() + (30 * 60 * 1000)).toISOString();
+    const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: publishAt,
+      metadata: { youtube_v0: { stage: "scheduled", video_id: videoId } },
+    });
+    const { workItem, launchGeneration } = await insertScheduledActivation(client, pipelineItem, { videoId, publishAt });
+
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", output: { live_check: {
+          status: "public",
+          checked_at: publishAt,
+          public_url: publicUrl,
+          launch_generation: launchGeneration,
+          evidence: { source: "youtube_data_api", video_id: videoId, visibility: "public", public_url: publicUrl },
+        } } },
+        verifyPublishedContent,
+      }),
+      /cannot activate before the scheduled publish time/i,
+    );
+
+    const row = (await client.query("select status,published_at,current_url from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "scheduled");
+    assert.equal(row.published_at, null);
+    assert.equal(row.current_url, null);
+  });
+});
+
+test("YouTube live-check rejects duplicate open activation identities", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "Duplicate01";
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: "2026-08-01T10:00:00.000Z",
+      metadata: { youtube_v0: { stage: "scheduled", video_id: videoId } },
+    });
+    const { workItem, launchGeneration } = await insertScheduledActivation(client, pipelineItem, { videoId });
+    await insertWorkItem(client, pipelineItem, {
+      trigger: "youtube_launch_package_v1",
+      relation_type: "video_launch_activate",
+      action: "video_launch_activate",
+      source_video_pipeline_item_id: pipelineItem.id,
+      pipeline_item_id: pipelineItem.id,
+      video_id: videoId,
+      publish_at: "2026-08-01T10:00:00.000Z",
+      launch_generation: launchGeneration,
+    });
+    const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", output: { live_check: {
+          status: "public",
+          checked_at: "2026-08-01T10:02:00.000Z",
+          public_url: publicUrl,
+          launch_generation: launchGeneration,
+          evidence: { source: "youtube_data_api", video_id: videoId, visibility: "public", public_url: publicUrl },
+        } } },
+        verifyPublishedContent,
+      }),
+      /exactly one current activation/i,
+    );
+    const row = (await client.query("select status,published_at from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "scheduled");
+    assert.equal(row.published_at, null);
+  });
+});
+
+test("YouTube live-check without public URL/evidence fails closed and leaves scheduled parent unchanged", async () => {
+  await inRollbackTransaction(async (client) => {
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      metadata: {
+        youtube_v0: { stage: "scheduled", video_id: "NoEvidence1" },
+        launch_package: { kind: "scheduled_youtube_launch_package_v1", status: "scheduled" },
+      },
+    });
+    const { workItem } = await insertScheduledActivation(client, pipelineItem, { videoId: "NoEvidence1" });
+
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", output: { live_check: { status: "public" } } },
+        verifyPublishedContent,
+      }),
+      /public URL and structured evidence/i,
+    );
+    const row = (await client.query("select status, published_at, current_url, metadata from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "scheduled");
+    assert.equal(row.published_at, null);
+    assert.equal(row.current_url, null);
+    assert.equal(row.metadata.launch_package.status, "scheduled");
+  });
+});
+
+test("YouTube live-check rejects a different video URL and does not publish", async () => {
+  await inRollbackTransaction(async (client) => {
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: "2026-08-01T10:00:00.000Z",
+      metadata: {
+        youtube_v0: { stage: "scheduled", video_id: "Expected001" },
+        launch_package: { kind: "scheduled_youtube_launch_package_v1", status: "scheduled", video_id: "Expected001" },
+      },
+    });
+    const { workItem, launchGeneration } = await insertScheduledActivation(client, pipelineItem, { videoId: "Expected001" });
+    const wrongUrl = "https://www.youtube.com/watch?v=Different01";
+
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", output: { live_check: {
+          status: "public",
+          checked_at: "2026-08-01T10:02:00.000Z",
+          public_url: wrongUrl,
+          launch_generation: launchGeneration,
+          evidence: { source: "youtube_data_api", video_id: "Different01", visibility: "public", public_url: wrongUrl },
+        } } },
+        verifyPublishedContent,
+      }),
+      /expected YouTube video/i,
+    );
+
+    const row = (await client.query("select status, published_at, current_url from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "scheduled");
+    assert.equal(row.published_at, null);
+    assert.equal(row.current_url, null);
+  });
+});
+
+test("YouTube live-check rejects evidence outside the current launch verification window", async () => {
+  await inRollbackTransaction(async (client) => {
+    const videoId = "WindowTest1";
+    const publishAt = new Date(Date.now() - (8 * 60 * 60 * 1000)).toISOString();
+    const checkedAt = new Date(Date.now() - (60 * 1000)).toISOString();
+    const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "scheduled",
+      scheduled_for: publishAt,
+      metadata: { youtube_v0: { stage: "scheduled", video_id: videoId } },
+    });
+    const { workItem, launchGeneration } = await insertScheduledActivation(client, pipelineItem, { videoId, publishAt });
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", output: { live_check: {
+          status: "public",
+          checked_at: checkedAt,
+          public_url: publicUrl,
+          launch_generation: launchGeneration,
+          evidence: { source: "youtube_data_api", video_id: videoId, visibility: "public", public_url: publicUrl },
+        } } },
+        verifyPublishedContent,
+      }),
+      /verification window/i,
+    );
+    const row = (await client.query("select status,published_at from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "scheduled");
+    assert.equal(row.published_at, null);
+  });
+});
+
+test("stale YouTube activation cannot publish a parked parent", async () => {
+  await inRollbackTransaction(async (client) => {
+    const publicUrl = "https://www.youtube.com/watch?v=Expected001";
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "parked",
+      scheduled_for: "2026-08-01T10:00:00.000Z",
+      metadata: {
+        youtube_v0: { stage: "scheduled", video_id: "Expected001" },
+        launch_package: { kind: "scheduled_youtube_launch_package_v1", status: "scheduled", video_id: "Expected001" },
+      },
+    });
+    const { workItem, launchGeneration } = await insertScheduledActivation(client, pipelineItem, { videoId: "Expected001" });
+
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", output: { live_check: {
+          status: "public",
+          checked_at: "2026-08-01T10:02:00.000Z",
+          public_url: publicUrl,
+          launch_generation: launchGeneration,
+          evidence: { source: "youtube_data_api", video_id: "Expected001", visibility: "public", public_url: publicUrl },
+        } } },
+        verifyPublishedContent,
+      }),
+      /requires an active scheduled parent/i,
+    );
+
+    const row = (await client.query("select status, published_at from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "parked");
+    assert.equal(row.published_at, null);
+  });
+});
+
+test("legacy YouTube gate completion is rejected for an active scheduled launch", async () => {
+  await inRollbackTransaction(async (client) => {
+    const pipelineItem = await insertPipelineItem(client, {
+      pipeline_type: "video",
+      status: "editing",
+      metadata: {
+        gates: { strategic_fit: { status: "not_started", history: [] } },
+        launch_package: { kind: "scheduled_youtube_launch_package_v1", status: "scheduled" },
+      },
+    });
+    const workItem = await insertWorkItem(client, pipelineItem, {
+      relation_type: "strategic_fit",
+      action: "youtube_gate_strategic_fit",
+      owner_agent: "youtube",
+    });
+    await assert.rejects(
+      () => orchestrateWorkItemCompletion(client, {
+        existing: workItem,
+        updated: completed(workItem),
+        body: { status: "done", gate_status: "in_progress" },
+        verifyPublishedContent,
+      }),
+      /reject legacy gate transitions/i,
+    );
+    const row = (await client.query("select status,metadata from pipeline_items where id=$1", [pipelineItem.id])).rows[0];
+    assert.equal(row.status, "editing");
+    assert.equal(row.metadata.gates.strategic_fit.status, "not_started");
+  });
 });

@@ -100,8 +100,21 @@ const reviewRoute = transpile(resolve(repoRoot, "src/app/api/loops/[id]/review/r
   "@/lib/db/postgres": db, "@/lib/supabase/server": { createClient: async () => { throw new Error("cloud forbidden"); } },
   "@/lib/loops/execution-instruction": { buildLoopReworkInstruction: () => "unused" },
 });
+const youtubeLaunchPackage = transpile(resolve(repoRoot, "src/lib/youtube-launch-package.ts"), {
+  "node:crypto": { randomUUID },
+});
 const completionOrchestration = transpile(resolve(repoRoot, "src/lib/work-items/completion-orchestration.ts"), {
-  "@/lib/youtube-pipeline": {}, "@/lib/work-items/git-artifact": {},
+  "@/lib/youtube-pipeline": {},
+  "@/lib/youtube-launch-package": {
+    ...youtubeLaunchPackage,
+    validateCommunityLaunchDraftOutput: () => ({ ok: true, errors: [] }),
+  },
+  "@/lib/youtube-launch-state": {
+    validateYouTubeLaunchPreflight: () => ({ ok: true, status: "pass", checkedAt: null, blockers: [], gates: {}, evidence: {}, remediation: null }),
+  },
+  "@/lib/work-items/external-delivery": {},
+  "@/lib/work-items/scheduled-launch-runtime": {},
+  "@/lib/work-items/git-artifact": {},
 });
 const agentCompletion = transpile(resolve(repoRoot, "src/lib/work-items/agent-completion-local.ts"), {
   "@/lib/content/live-verification": {}, "@/lib/db/mission-control": { normalizeRow: (row) => row },

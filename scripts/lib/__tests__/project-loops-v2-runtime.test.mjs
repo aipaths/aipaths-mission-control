@@ -3,6 +3,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,7 @@ import {
   quotePostgresIdentifier,
   requireMissionControlTestDatabaseUrl,
 } from "../test-postgres-guard.mjs";
+import { isPathWithinAllowedRoots } from "../../../src/lib/work-items/repository-roots.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const pool = new pg.Pool({ connectionString: requireMissionControlTestDatabaseUrl(), max: 8 });
@@ -69,7 +71,11 @@ const qaResult = transpileModule(resolve(repoRoot, "src/lib/qa/result.ts"), {
 });
 const executionInstruction = transpileModule(resolve(repoRoot, "src/lib/loops/execution-instruction.ts"));
 const gitArtifact = transpileModule(resolve(repoRoot, "src/lib/work-items/git-artifact.ts"), {
-  "node:child_process": { execFile }, "node:fs/promises": { realpath },
+  "node:child_process": { execFile }, "node:fs/promises": { realpath }, "node:os": { homedir },
+  "./repository-roots.mjs": {
+    isPathWithinAllowedRoots,
+    resolveAllowedRepositoryRoots: async () => [dirname(repoRoot)],
+  },
 });
 const createRoute = transpileModule(resolve(repoRoot, "src/app/api/loops/project/create/route.ts"), {
   "node:crypto": { createHash, randomUUID }, "next/server": nextServer,
@@ -104,8 +110,20 @@ const reviewRoute = transpileModule(resolve(repoRoot, "src/app/api/loops/[id]/re
   "@/lib/loops/execution-instruction": executionInstruction,
 });
 const youtubePipeline = transpileModule(resolve(repoRoot, "src/lib/youtube-pipeline.ts"));
+const youtubeLaunchPackage = transpileModule(resolve(repoRoot, "src/lib/youtube-launch-package.ts"), {
+  "node:crypto": { randomUUID },
+});
 const completion = transpileModule(resolve(repoRoot, "src/lib/work-items/completion-orchestration.ts"), {
   "@/lib/youtube-pipeline": youtubePipeline,
+  "@/lib/youtube-launch-package": {
+    ...youtubeLaunchPackage,
+    validateCommunityLaunchDraftOutput: () => ({ ok: true, errors: [] }),
+  },
+  "@/lib/youtube-launch-state": {
+    validateYouTubeLaunchPreflight: () => ({ ok: true, status: "pass", checkedAt: null, blockers: [], gates: {}, evidence: {}, remediation: null }),
+  },
+  "@/lib/work-items/external-delivery": {},
+  "@/lib/work-items/scheduled-launch-runtime": {},
   "@/lib/work-items/git-artifact": gitArtifact,
 });
 const agentCompletion = transpileModule(resolve(repoRoot, "src/lib/work-items/agent-completion-local.ts"), {

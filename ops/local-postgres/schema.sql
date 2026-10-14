@@ -213,6 +213,30 @@ CREATE INDEX IF NOT EXISTS idx_work_items_payload_pipeline_type ON public.work_i
 CREATE INDEX IF NOT EXISTS idx_work_items_payload_relation_type ON public.work_items((payload ->> 'relation_type'));
 CREATE INDEX IF NOT EXISTS idx_work_items_payload_dedupe_key ON public.work_items((payload ->> 'dedupe_key'));
 
+CREATE TABLE IF NOT EXISTS public.external_delivery_attempts (
+  idempotency_key text PRIMARY KEY,
+  work_item_id uuid NOT NULL REFERENCES public.work_items(id) ON DELETE RESTRICT,
+  scope jsonb NOT NULL,
+  status text NOT NULL,
+  claim_token uuid NOT NULL DEFAULT gen_random_uuid(),
+  claim_attempt integer NOT NULL DEFAULT 1,
+  claimed_at timestamptz NOT NULL,
+  provider_accepted_at timestamptz,
+  provider_delivery_id text,
+  result jsonb,
+  last_error text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT external_delivery_attempts_key_check CHECK (idempotency_key ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{7,191}$'),
+  CONSTRAINT external_delivery_attempts_status_check CHECK (status IN ('pending','failed_pre_delivery','accepted','ambiguous')),
+  CONSTRAINT external_delivery_attempts_claim_attempt_check CHECK (claim_attempt > 0),
+  CONSTRAINT external_delivery_attempts_accepted_shape_check CHECK (
+    (status = 'accepted' AND provider_accepted_at IS NOT NULL AND nullif(btrim(provider_delivery_id), '') IS NOT NULL)
+    OR (status <> 'accepted' AND provider_accepted_at IS NULL AND provider_delivery_id IS NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_external_delivery_attempts_work_item ON public.external_delivery_attempts(work_item_id);
+CREATE INDEX IF NOT EXISTS idx_external_delivery_attempts_status_updated ON public.external_delivery_attempts(status, updated_at);
+
 CREATE TABLE IF NOT EXISTS public.work_item_dependencies (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   work_item_id uuid NOT NULL REFERENCES public.work_items(id) ON DELETE CASCADE,
@@ -864,7 +888,9 @@ CREATE INDEX IF NOT EXISTS idx_loop_task_reviews_run ON public.loop_task_reviews
 CREATE TABLE IF NOT EXISTS public.review_repositories (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   key text NOT NULL UNIQUE CHECK (key ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$'),
-  canonical_root text NOT NULL UNIQUE CHECK (canonical_root LIKE '/Users/joaco/openclaw/%'),
+  canonical_root text NOT NULL UNIQUE CHECK (
+    canonical_root LIKE '/%' AND canonical_root <> '/' AND canonical_root !~ '[[:cntrl:]]'
+  ),
   git_common_dir text NOT NULL UNIQUE,
   object_format text NOT NULL CHECK (object_format IN ('sha1','sha256')),
   enabled boolean NOT NULL DEFAULT true,
@@ -1413,6 +1439,49 @@ CREATE TABLE IF NOT EXISTS public.ops_community_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_ops_community_daily_date ON public.ops_community_daily(date DESC);
 
+CREATE TABLE IF NOT EXISTS public.ops_community_member_daily (
+  date date NOT NULL,
+  guild_id text NOT NULL,
+  new_human_members integer NOT NULL,
+  total_members_at_check integer,
+  human_members_at_check integer,
+  bot_members_at_check integer,
+  checked_at timestamptz NOT NULL,
+  coverage text NOT NULL,
+  source text NOT NULL DEFAULT 'discord_list_guild_members',
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (date, guild_id),
+  CONSTRAINT ops_community_member_daily_new_human_members_check
+    CHECK (new_human_members >= 0),
+  CONSTRAINT ops_community_member_daily_snapshot_counts_check
+    CHECK (
+      (
+        total_members_at_check IS NULL
+        AND human_members_at_check IS NULL
+        AND bot_members_at_check IS NULL
+      )
+      OR (
+        total_members_at_check IS NOT NULL
+        AND human_members_at_check IS NOT NULL
+        AND bot_members_at_check IS NOT NULL
+        AND total_members_at_check >= 0
+        AND human_members_at_check >= 0
+        AND bot_members_at_check >= 0
+        AND total_members_at_check = human_members_at_check + bot_members_at_check
+      )
+    ),
+  CONSTRAINT ops_community_member_daily_coverage_check
+    CHECK (coverage IN ('daily_member_list_snapshot', 'current_member_list_backfill')),
+  CONSTRAINT ops_community_member_daily_source_check
+    CHECK (source = 'discord_list_guild_members'),
+  CONSTRAINT ops_community_member_daily_metadata_object_check
+    CHECK (jsonb_typeof(metadata) = 'object')
+);
+CREATE INDEX IF NOT EXISTS idx_ops_community_member_daily_checked_at
+  ON public.ops_community_member_daily(checked_at DESC);
+
 CREATE TABLE IF NOT EXISTS public.ops_youtube_comments (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   run_id bigint REFERENCES public.pipeline_runs(id) ON DELETE SET NULL,
@@ -1514,14 +1583,14 @@ DECLARE
 BEGIN
   FOREACH tbl IN ARRAY ARRAY[
     'system_cursors','scheduler_config','execution_window_config','services',
-    'cron_health','cron_logs','work_items','work_item_dependencies','event_log',
+    'cron_health','cron_logs','work_items','external_delivery_attempts','work_item_dependencies','event_log',
     'recurring_work_rules','recurring_work_occurrences','pipeline_items','pipeline_events','pipeline_work_map',
     'loops','loop_events','loop_work_items','loop_plan_revisions','loop_stages','loop_tasks',
     'loop_task_dependencies','loop_task_runs','loop_task_reviews','loop_evidence','memories','usage_logs','activity_log',
     'pipeline_runs','intel_runs','intel_sources','intel_items_raw','intel_items_enriched','intel_inbox_reviews','intel_trend_daily',
     'competitor_channels','competitor_video_snapshots','competitor_transcripts',
     'ops_owned_videos','ops_youtube_video_daily','ops_youtube_short_daily','ops_youtube_channel_daily','ops_community_daily',
-    'ops_youtube_comments','academy_daily_kpis','ops_daily_snapshots','ops_youtube_video_learning_snapshots'
+    'ops_community_member_daily','ops_youtube_comments','academy_daily_kpis','ops_daily_snapshots','ops_youtube_video_learning_snapshots'
   ] LOOP
     EXECUTE format('ALTER TABLE IF EXISTS public.%I DISABLE ROW LEVEL SECURITY', tbl);
   END LOOP;
@@ -2531,6 +2600,73 @@ BEGIN
 END $body$;
 CREATE TRIGGER qa_executions_terminal_immutable BEFORE UPDATE OR DELETE ON public.qa_executions FOR EACH ROW EXECUTE FUNCTION public.reject_terminal_loop_quality_mutation();
 
+-- -----------------------------------------------------------------------------
+-- Canonical YouTube playlist catalog (read-only application surface)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.youtube_playlists (
+  playlist_id text PRIMARY KEY,
+  canonical_slug text NOT NULL UNIQUE,
+  title text NOT NULL,
+  description text,
+  url text NOT NULL,
+  kind text NOT NULL,
+  purpose text,
+  audience text,
+  status text NOT NULL DEFAULT 'draft',
+  featured boolean NOT NULL DEFAULT false,
+  home_order integer,
+  aliases text[] NOT NULL DEFAULT '{}'::text[],
+  use_cases text[] NOT NULL DEFAULT '{}'::text[],
+  tags text[] NOT NULL DEFAULT '{}'::text[],
+  source text NOT NULL DEFAULT 'manual',
+  source_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  live_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  source_observed_at timestamptz,
+  last_synced_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT youtube_playlists_id_check CHECK (playlist_id ~ '^[A-Za-z0-9_-]+$'),
+  CONSTRAINT youtube_playlists_slug_check CHECK (canonical_slug ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$'),
+  CONSTRAINT youtube_playlists_kind_check CHECK (kind IN ('hub','official_series','archive','shorts')),
+  CONSTRAINT youtube_playlists_status_check CHECK (status IN ('active','archived','draft')),
+  CONSTRAINT youtube_playlists_home_order_check CHECK (home_order IS NULL OR home_order > 0),
+  CONSTRAINT youtube_playlists_feature_order_check CHECK (NOT featured OR home_order IS NOT NULL),
+  CONSTRAINT youtube_playlists_metadata_check CHECK (jsonb_typeof(source_metadata)='object' AND jsonb_typeof(live_metadata)='object')
+);
+CREATE TABLE IF NOT EXISTS public.youtube_playlist_videos (
+  playlist_id text NOT NULL REFERENCES public.youtube_playlists(playlist_id) ON DELETE CASCADE,
+  video_id text NOT NULL,
+  title text,
+  position integer NOT NULL,
+  membership_reason text,
+  membership_role text,
+  source_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (playlist_id, video_id),
+  CONSTRAINT youtube_playlist_videos_id_check CHECK (video_id ~ '^[A-Za-z0-9_-]+$'),
+  CONSTRAINT youtube_playlist_videos_position_check CHECK (position > 0),
+  CONSTRAINT youtube_playlist_videos_metadata_check CHECK (jsonb_typeof(source_metadata)='object')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_youtube_playlist_videos_position ON public.youtube_playlist_videos(playlist_id, position);
+CREATE INDEX IF NOT EXISTS idx_youtube_playlists_status_home ON public.youtube_playlists(status, featured DESC, home_order, canonical_slug);
+CREATE INDEX IF NOT EXISTS idx_youtube_playlists_use_cases ON public.youtube_playlists USING gin(use_cases);
+CREATE INDEX IF NOT EXISTS idx_youtube_playlists_tags ON public.youtube_playlists USING gin(tags);
+CREATE INDEX IF NOT EXISTS idx_youtube_playlists_aliases ON public.youtube_playlists USING gin(aliases);
+CREATE INDEX IF NOT EXISTS idx_youtube_playlist_videos_order ON public.youtube_playlist_videos(playlist_id, position, video_id);
+
+ALTER TABLE public.youtube_playlists ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.youtube_playlist_videos ENABLE ROW LEVEL SECURITY;
+DO $youtube_playlist_policies$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aipaths_mc_app') THEN
+    DROP POLICY IF EXISTS "youtube_playlists app read" ON public.youtube_playlists;
+    EXECUTE 'CREATE POLICY "youtube_playlists app read" ON public.youtube_playlists FOR SELECT TO aipaths_mc_app USING (true)';
+    DROP POLICY IF EXISTS "youtube_playlist_videos app read" ON public.youtube_playlist_videos;
+    EXECUTE 'CREATE POLICY "youtube_playlist_videos app read" ON public.youtube_playlist_videos FOR SELECT TO aipaths_mc_app USING (true)';
+  END IF;
+END $youtube_playlist_policies$;
+
 -- Ordinary application SQL keeps existing Mission Control behavior but cannot
 -- read key material or write/re-key/truncate QA authority rows. QA mutations are
 -- exposed only through the exact entry points above.
@@ -2554,4 +2690,21 @@ ALTER FUNCTION public.qa_result_is_valid(jsonb,text,jsonb) OWNER TO aipaths_mc_q
 GRANT EXECUTE ON FUNCTION public.qa_jsonb_canonical(jsonb),public.qa_jsonb_sha256(jsonb),
   public.qa_text_is_valid(text,integer),public.qa_target_url_is_valid(text),public.qa_policy_is_valid(jsonb),
   public.qa_result_is_valid(jsonb,text,jsonb) TO aipaths_mc_app;
+COMMIT;
+
+-- GON-226: scoped write path for pipeline_items so content-pipeline tools (e.g.
+-- video-validation-save.mjs and successors) don't need aipaths_mc_app's blanket
+-- CRUD-on-everything grant or raw superuser SQL. LOGIN password is set out of
+-- band (matches aipaths_mc_readonly convention) and is not committed here.
+BEGIN;
+DO $pipeline_writer_role$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='aipaths_mc_pipeline_writer') THEN
+    CREATE ROLE aipaths_mc_pipeline_writer LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION;
+  END IF;
+END $pipeline_writer_role$;
+ALTER ROLE aipaths_mc_pipeline_writer LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT USAGE ON SCHEMA public TO aipaths_mc_pipeline_writer;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM aipaths_mc_pipeline_writer;
+GRANT SELECT, INSERT, UPDATE ON public.pipeline_items TO aipaths_mc_pipeline_writer;
 COMMIT;

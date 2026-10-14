@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { getLocalMissionControlUser, isLocalAuthDisabled } from "@/lib/auth/local";
 import { getPipelineItemLocal, updatePipelineItemLocal } from "@/lib/db/pipeline-local";
 import {
+  approveEmailCampaignLocalAtomic,
   EmailCampaignLocalError,
   requestEmailChangesLocalAtomic,
   scheduleEmailCampaignLocalAtomic,
@@ -9,6 +10,7 @@ import {
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/admin";
 import { createPipelineWorkItem } from "@/lib/work-items/pipeline-materializer";
+import { buildScheduledLaunchPublicActionPayload } from "@/lib/youtube-launch-package";
 
 export const dynamic = "force-dynamic";
 
@@ -52,6 +54,7 @@ function buildSendInstruction(input: {
   kind: string | null;
   scheduledFor: string;
   draft: JsonRecord;
+  requiresYouTubeLiveGate?: boolean;
 }) {
   return [
     `Email campaign pipeline item: ${input.title}`,
@@ -65,6 +68,9 @@ function buildSendInstruction(input: {
     "- The command blocks if the HTML has no aipaths.academy link with ref=email-*; fix the draft, do not bypass it.",
     "- Use only the approved draft below. Do not rewrite unless there is a blocking formatting issue.",
     "- If real sending infrastructure is not available yet, complete the work item as blocked/failed with the exact blocker; do not invent a send result.",
+    ...(input.requiresYouTubeLiveGate ? [
+      "- YouTube launch gate: before sending, verify privacyStatus=public/live and that Gonza approved this campaign; block if not confirmed.",
+    ] : []),
     "- When sent, complete this work item with output.sent_at and any provider/campaign URL or ID available.",
     "",
     "Approved draft JSON:",
@@ -116,6 +122,20 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return NextResponse.json(await scheduleEmailCampaignLocalAtomic({
         campaignId: id,
         scheduledFor: new Date(scheduledTimestamp).toISOString(),
+        actorIdentity,
+      }));
+    } catch (error) {
+      if (error instanceof EmailCampaignLocalError) {
+        return NextResponse.json({ error: error.message }, { status: error.status });
+      }
+      throw error;
+    }
+  }
+
+  if (useLocalMode && action === "approve") {
+    try {
+      return NextResponse.json(await approveEmailCampaignLocalAtomic({
+        campaignId: id,
         actorIdentity,
       }));
     } catch (error) {
@@ -232,6 +252,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         status: "approved",
         approved_at: now,
         approved_by: actorIdentity,
+        launch_generation: readString(asObject(metadata.launch_package).launch_generation),
       },
       runtime_feedback: {
         ...asObject(metadata.runtime_feedback),
@@ -273,6 +294,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         kind: readString(metadata.kind),
         scheduledFor,
         draft,
+        requiresYouTubeLiveGate: readString(metadata.kind) === "video_announcement" || readString(asObject(metadata.source).video_id) !== null,
       }),
       priority: item.priority || "medium",
       ownerAgent: "marketing",
@@ -284,13 +306,34 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       payloadExtra: {
         email_campaign_kind: readString(metadata.kind),
         schedule_kind: "email_send",
+        ...(readString(metadata.kind) === "video_announcement" || readString(asObject(metadata.source).video_id) !== null ? {
+          public_gate_applies_to: "publish_or_send_only",
+          requires_live_check_passed: true,
+          requires_gonza_approval: true,
+          source_video_id: readString(asObject(metadata.source).video_id),
+          ...buildScheduledLaunchPublicActionPayload({
+            metadata,
+            ownerAgent: "marketing",
+            action: "send_email_campaign",
+            destination: "ai_paths_email",
+          }),
+        } : {}),
       },
     };
     const result = await createPipelineWorkItem(db!, workInput);
+    const alignedPayload = {
+      ...asObject(result.workItem.payload),
+      trigger: workInput.trigger,
+      pipeline_type: workInput.pipelineType,
+      pipeline_item_id: workInput.pipelineItemId,
+      relation_type: workInput.relationType,
+      action: workInput.action,
+      ...workInput.payloadExtra,
+    };
 
     // If an open send work item already existed, createPipelineWorkItem dedupes it;
-    // keep its schedule/instructions aligned with the latest selected date.
-    await db!
+    // keep its schedule, instructions, and governed launch contract aligned.
+    const { data: alignedWorkItem, error: alignedWorkItemError } = await db!
       .from("work_items")
       .update({
         title: `Send email campaign: ${item.title}`,
@@ -299,12 +342,19 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           kind: readString(metadata.kind),
           scheduledFor,
           draft,
+          requiresYouTubeLiveGate: readString(metadata.kind) === "video_announcement" || readString(asObject(metadata.source).video_id) !== null,
         }),
         scheduled_for: scheduledFor,
         status: result.workItem.status === "in_progress" ? "in_progress" : "ready",
+        payload: alignedPayload,
         updated_at: now,
       })
-      .eq("id", result.workItem.id);
+      .eq("id", result.workItem.id)
+      .select("id,status,scheduled_for,payload")
+      .single();
+    if (alignedWorkItemError || !alignedWorkItem) {
+      return NextResponse.json({ error: "Failed to align scheduled email work item" }, { status: 500 });
+    }
 
     const nextMetadata = {
       ...metadata,
@@ -336,7 +386,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     if (!updated) return NextResponse.json({ error: "Failed to schedule email campaign" }, { status: 500 });
 
-    return NextResponse.json({ item: updated, workItem: { ...result.workItem, scheduled_for: scheduledFor } });
+    return NextResponse.json({ item: updated, workItem: alignedWorkItem });
   }
 
   return NextResponse.json({ error: "Invalid action" }, { status: 400 });
