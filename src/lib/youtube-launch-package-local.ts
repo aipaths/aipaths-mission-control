@@ -1139,7 +1139,7 @@ export async function createScheduledYouTubeLaunchPackageLocal(input: YouTubeLau
     const targetEmailSendAt = input.targetEmailSendAt
       ? normalizeIsoDate(input.targetEmailSendAt, "target_email_send_at")
       : addMilliseconds(publishAt, 3 * 60 * 60 * 1000);
-    const emailTrackingRef = trimToNull(input.emailTrackingRef) || `email-youtube-${videoId}`;
+    const emailTrackingRef = trimToNull(input.emailTrackingRef) || `email-video-${videoId.toLowerCase()}-${publishAt.slice(0, 10)}`;
     const optionalDiagnosticCta =
       trimToNull(input.optionalDiagnosticCta) || firstStringFromRecords([refs], [["optional_diagnostic_cta"], ["diagnostic_cta"]]);
     const cta = trimToNull(input.cta) || firstStringFromRecords([refs], [["cta"], ["community", "cta"]]);

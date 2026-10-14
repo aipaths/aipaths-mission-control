@@ -512,6 +512,7 @@ function marketingEmailInstruction(input: ScheduledYouTubeLaunchSpecContext) {
     "Task:",
     "- Use the structured launch context below to draft a Spanish email campaign handoff for this YouTube video.",
     "- Marketing owns copy, segmentation, approval, and scheduling workflow; do not treat Strategist/Dev automation as the policy source of truth.",
+    "- REQUIRED: body_markdown must include a CTA link to https://aipaths.academy with ref=<email_tracking_ref> from the context below (the ref must start with `email-`). The YouTube link carries no ref and cannot be the only CTA; drafts without it are rejected.",
     "- Produce a draft for Gonza approval only; do not send or schedule the email yourself.",
     "- Complete with output.email_draft containing subject, preview_text, and body_markdown so Mission Control can move the email campaign to ready_for_review.",
     "",
@@ -1691,7 +1692,7 @@ export async function createScheduledYouTubeLaunchPackage(db: SupabaseClient, in
   requireCommunityPlaylistContextUrl(videoId, playlistContextUrl);
   const playlistId = playlistIdFromContextUrl(videoId, playlistContextUrl);
   const targetEmailSendAt = input.targetEmailSendAt ? normalizeIsoDate(input.targetEmailSendAt, "target_email_send_at") : addMilliseconds(publishAt, 3 * 60 * 60 * 1000);
-  const emailTrackingRef = trimToNull(input.emailTrackingRef) || `email-youtube-${videoId}`;
+  const emailTrackingRef = trimToNull(input.emailTrackingRef) || `email-video-${videoId.toLowerCase()}-${publishAt.slice(0, 10)}`;
   const optionalDiagnosticCta = trimToNull(input.optionalDiagnosticCta) || firstStringFromRecords([refs], [["optional_diagnostic_cta"], ["diagnostic_cta"]]);
   const cta = trimToNull(input.cta) || firstStringFromRecords([refs], [["cta"], ["community", "cta"]]);
   const launchGeneration = reusableLaunchGenerationFromMetadata({

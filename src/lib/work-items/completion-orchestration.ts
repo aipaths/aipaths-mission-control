@@ -28,6 +28,12 @@ import { verifyRepositoryCommit } from "@/lib/work-items/git-artifact";
 
 export type JsonRecord = Record<string, unknown>;
 
+const SITE_CTA_WITH_EMAIL_REF = /https?:\/\/(?:www\.)?aipaths\.academy[^\s)"'<>]*[?&]ref=email-[^\s&)"'<>#]+/i;
+
+export function hasSiteCtaWithEmailRef(bodyMarkdown: unknown) {
+  return typeof bodyMarkdown === "string" && SITE_CTA_WITH_EMAIL_REF.test(bodyMarkdown);
+}
+
 export type CompletionQueryClient = {
   query<T extends Record<string, unknown> = Record<string, unknown>>(
     text: string,
@@ -1582,6 +1588,9 @@ export async function orchestrateWorkItemCompletion(
 
     const emailDraft = asRecord(asRecord(body.output).email_draft);
     if (Object.keys(emailDraft).length) {
+      if (!hasSiteCtaWithEmailRef(emailDraft.body_markdown)) {
+        throw new Error("email_draft_missing_site_cta_ref: body_markdown needs a link to aipaths.academy with ref=email-* (YouTube links carry no ref)");
+      }
       await updatePipelineItem(client, pipelineItemId, "ready_for_review", {
         ...metadata,
         draft: emailDraft,
