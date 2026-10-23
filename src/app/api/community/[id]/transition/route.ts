@@ -12,6 +12,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/admin";
 import { resolveCommunityPublicationSlot, getCommunityPublicationSegment } from "@/lib/publication/scheduling";
 import { createPipelineWorkItem } from "@/lib/work-items/pipeline-materializer";
+import { buildScheduledLaunchPublicActionPayload } from "@/lib/youtube-launch-package";
 
 export const dynamic = "force-dynamic";
 
@@ -199,6 +200,12 @@ export async function POST(
     return NextResponse.json({ error: "Community post already has a publication record" }, { status: 409 });
   }
 
+  const launchGenerationFor = (transitionItem: { metadata?: Record<string, unknown> | null }) => {
+    const launchPackage = (transitionItem.metadata || {}).launch_package;
+    if (!launchPackage || typeof launchPackage !== "object" || Array.isArray(launchPackage)) return null;
+    const value = (launchPackage as Record<string, unknown>).launch_generation;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  };
   const buildMetadata = (transitionItem: { metadata?: Record<string, unknown> | null }): Record<string, unknown> => ({
     ...(transitionItem.metadata || {}),
     review: {
@@ -214,6 +221,7 @@ export async function POST(
         ? {
             approved_at: new Date().toISOString(),
             approved_by: actorIdentity,
+            launch_generation: launchGenerationFor(transitionItem),
           }
         : {}),
     },
@@ -237,6 +245,7 @@ export async function POST(
         const localMetadata = buildMetadata(lockedItem);
         let localRevisionWorkItemId: string | null = null;
         let localPublishWorkItemId: string | null = null;
+        let localPublishShouldNotify = false;
         let localScheduledFor: string | null = null;
         let localScheduleSource: string | null = null;
 
@@ -264,6 +273,7 @@ export async function POST(
           const slot = await resolveCommunityPublicationSlotLocal({
             metadata: lockedItem.metadata || {},
             explicitScheduledFor: explicitLaunchSchedule,
+            existingScheduledFor: typeof lockedItem.scheduled_for === "string" ? lockedItem.scheduled_for : null,
             pipelineItemId: lockedItem.id,
             client,
           });
@@ -274,6 +284,12 @@ export async function POST(
           const sourceUrl = [source.url, source.video_url, source.playlist_url]
             .find((value) => typeof value === "string" && value.trim()) as string | undefined;
           const allowsYouTubePreview = source.type === "video" && !!sourceUrl && /(?:youtube\.com|youtu\.be)/i.test(sourceUrl);
+          const launchPublicPayload = buildScheduledLaunchPublicActionPayload({
+            metadata: localMetadata,
+            ownerAgent: "community",
+            action: "publish_community_post",
+            destination: target.channelId,
+          });
           const { workItem } = await createPipelineWorkItemLocal({
             pipelineItemId: lockedItem.id,
             pipelineType: "community_post",
@@ -286,6 +302,7 @@ export async function POST(
             action: "publish_community_post",
             trigger: localScheduledFor ? "community_review_approved_scheduled" : "community_review_approved_immediate",
             scheduledFor: localScheduledFor,
+            updateExisting: Boolean(localScheduledFor),
             payloadExtra: {
               schedule_kind: "publication",
               community_segment: getCommunityPublicationSegment(lockedItem.metadata || {}),
@@ -293,9 +310,17 @@ export async function POST(
               target_channel_name: target.channelName,
               log_channel_id: "1473660854800224316",
               suppress_link_previews: !allowsYouTubePreview,
+              ...(allowsYouTubePreview ? {
+                public_gate_applies_to: "publish_or_send_only",
+                requires_live_check_passed: true,
+                requires_gonza_approval: true,
+                source_video_id: typeof source.video_id === "string" ? source.video_id : null,
+                ...launchPublicPayload,
+              } : {}),
             },
           }, client);
           localPublishWorkItemId = workItem?.id || null;
+          localPublishShouldNotify = !localScheduledFor && workItem?.status === "ready";
         }
 
         const nextStatus = action === "approve" && localPublishWorkItemId ? "scheduled" : targetStatus;
@@ -316,6 +341,7 @@ export async function POST(
             : localMetadata,
           updated_at: new Date().toISOString(),
         };
+        if (action === "approve" && localScheduledFor) localUpdatePayload.scheduled_for = localScheduledFor;
         if (current_url) localUpdatePayload.current_url = current_url;
         if (action === "mark_published") localUpdatePayload.published_at = new Date().toISOString();
         const updatedItem = await updatePipelineItemLocal(id, localUpdatePayload, client);
@@ -334,11 +360,11 @@ export async function POST(
             schedule_source: localScheduleSource,
           },
         });
-        return { updatedItem, localRevisionWorkItemId, localPublishWorkItemId, localScheduledFor };
+        return { updatedItem, localRevisionWorkItemId, localPublishWorkItemId, localPublishShouldNotify, localScheduledFor };
       });
       if (!localResult?.updatedItem) return NextResponse.json({ error: "Failed to update community item" }, { status: 500 });
       if (localResult.localRevisionWorkItemId) void notifyWorkItem(localResult.localRevisionWorkItemId, "community");
-      if (localResult.localPublishWorkItemId && !localResult.localScheduledFor) void notifyWorkItem(localResult.localPublishWorkItemId, "community");
+      if (localResult.localPublishWorkItemId && localResult.localPublishShouldNotify) void notifyWorkItem(localResult.localPublishWorkItemId, "community");
       return NextResponse.json(localResult.updatedItem);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed local community transition";
@@ -348,6 +374,7 @@ export async function POST(
 
   let revisionWorkItemId: string | null = null;
   let publishWorkItemId: string | null = null;
+  let publishShouldNotify = false;
   let approvedScheduledFor: string | null = null;
   let approvedScheduleSource: string | null = null;
 
@@ -384,6 +411,7 @@ export async function POST(
       const slot = await resolveCommunityPublicationSlot(db!, {
         metadata: metadataForSchedule,
         explicitScheduledFor: explicitLaunchSchedule,
+        existingScheduledFor: typeof item.scheduled_for === "string" ? item.scheduled_for : null,
         pipelineItemId: item.id,
       });
       approvedScheduledFor = slot?.scheduledFor || null;
@@ -393,6 +421,12 @@ export async function POST(
       const sourceUrl = [source.url, source.video_url, source.playlist_url]
         .find((value) => typeof value === "string" && value.trim()) as string | undefined;
       const allowsYouTubePreview = source.type === "video" && !!sourceUrl && /(?:youtube\.com|youtu\.be)/i.test(sourceUrl);
+      const launchPublicPayload = buildScheduledLaunchPublicActionPayload({
+        metadata,
+        ownerAgent: "community",
+        action: "publish_community_post",
+        destination: target.channelId,
+      });
       const workInput = {
         pipelineItemId: item.id,
         pipelineType: "community_post",
@@ -405,6 +439,7 @@ export async function POST(
         action: "publish_community_post",
         trigger: approvedScheduledFor ? "community_review_approved_scheduled" : "community_review_approved_immediate",
         scheduledFor: approvedScheduledFor,
+        updateExisting: Boolean(approvedScheduledFor),
         payloadExtra: {
           schedule_kind: "publication",
           community_segment: getCommunityPublicationSegment(metadataForSchedule),
@@ -412,10 +447,18 @@ export async function POST(
           target_channel_name: target.channelName,
           log_channel_id: "1473660854800224316",
           suppress_link_previews: !allowsYouTubePreview,
+          ...(allowsYouTubePreview ? {
+            public_gate_applies_to: "publish_or_send_only",
+            requires_live_check_passed: true,
+            requires_gonza_approval: true,
+            source_video_id: typeof source.video_id === "string" ? source.video_id : null,
+            ...launchPublicPayload,
+          } : {}),
         },
       };
       const { workItem } = await createPipelineWorkItem(db!, workInput);
       publishWorkItemId = workItem?.id || null;
+      publishShouldNotify = !approvedScheduledFor && workItem?.status === "ready";
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error("[community.transition] Failed to create publish work item", err);
@@ -444,13 +487,14 @@ export async function POST(
 
   if (current_url) updatePayload.current_url = current_url;
   if (action === "mark_published") updatePayload.published_at = new Date().toISOString();
+  if (action === "approve" && approvedScheduledFor) updatePayload.scheduled_for = approvedScheduledFor;
 
   const updated = await (async () => {
     const { data, error } = await db!
       .from("pipeline_items")
       .update(updatePayload)
       .eq("id", id)
-      .select("id, pipeline_type, title, slug, status, priority, owner_agent, requested_by, source_type, source_id, published_at, current_url, content_path, content_format, metadata, created_at, updated_at")
+      .select("id, pipeline_type, title, slug, status, priority, owner_agent, requested_by, source_type, source_id, scheduled_for, published_at, current_url, content_path, content_format, metadata, created_at, updated_at")
       .single();
     if (error) throw new Error(error.message);
     return data;
@@ -461,7 +505,7 @@ export async function POST(
   }
 
   if (revisionWorkItemId) void notifyWorkItem(revisionWorkItemId, "community");
-  if (publishWorkItemId && !approvedScheduledFor) void notifyWorkItem(publishWorkItemId, "community");
+  if (publishWorkItemId && publishShouldNotify) void notifyWorkItem(publishWorkItemId, "community");
 
   const { error: eventError } = await db!.from("event_log").insert({
     domain: "community",

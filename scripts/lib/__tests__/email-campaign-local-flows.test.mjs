@@ -58,6 +58,7 @@ function transpileModule(sourcePath, requires) {
 const localFlows = transpileModule(helperSource, {
   "@/lib/db/postgres": { withTransaction: withTestTransaction },
   "@/lib/db/mission-control": { normalizeRow: (row) => row, normalizeRows: (rows) => rows },
+  "@/lib/youtube-launch-package": { buildScheduledLaunchPublicActionPayload: () => ({}) },
 });
 const createdPipelineIds = new Set();
 
@@ -250,4 +251,11 @@ test("schedule rerun updates one open work item but never rewrites terminal work
   const rolledBackCampaign = (await pool.query("select status, scheduled_for from public.pipeline_items where id = $1", [rollbackCampaignId])).rows[0];
   assert.equal(rolledBackCampaign.status, "ready_for_review");
   assert.equal(rolledBackCampaign.scheduled_for, null);
+});
+
+test("Email Campaigns UI copy treats approval as auto-scheduled for Scheduled Launch emails", () => {
+  const source = readFileSync(resolve(repoRoot, "src/components/email-campaigns/EmailCampaignsClient.tsx"), "utf8");
+  assert.match(source, /Email aprobado y programado/);
+  assert.match(source, /Aprobar y programar/);
+  assert.doesNotMatch(source, /Email aprobado\. Queda en Aprobados para programar\./);
 });

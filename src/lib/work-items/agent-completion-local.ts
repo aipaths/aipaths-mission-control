@@ -33,6 +33,24 @@ const FRESH_REVIEW_CONTROLLED_PAYLOAD_KEYS = new Set([
   "plan_revision_id", "plan_hash",
 ]);
 
+const YOUTUBE_LAUNCH_CONTROLLED_PAYLOAD_KEYS = new Set([
+  "trigger", "action", "pipeline_type", "pipeline_item_id", "source_video_pipeline_item_id",
+  "relation_type", "map_relation_type", "video_id", "youtube_url", "publish_at",
+  "launch_state_contract", "launch_generation", "schedule_kind",
+  "requires_preflight_passed", "preflight_relation_type", "requires_live_check_passed",
+  "live_check_relation_type", "requires_gonza_approval", "approval_status",
+  "approval_manual_out_of_scope", "customer_facing_guard", "public_gate_applies_to",
+  "runtime_retry_contract", "retry_policy", "external_delivery_idempotency_key",
+  "idempotency_scope", "external_delivery_claim", "external_delivery_result",
+]);
+
+function isScheduledLaunchControlledPayload(payload: JsonRecord) {
+  return payload.trigger === "youtube_launch_package_v1"
+    || payload.launch_state_contract === "scheduled_launch_v2"
+    || payload.runtime_retry_contract === "scheduled_launch_v2_retry_v1"
+    || typeof payload.external_delivery_idempotency_key === "string";
+}
+
 function jsonValuesEqual(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
   if (Array.isArray(left) || Array.isArray(right)) {
@@ -171,11 +189,15 @@ export async function patchAgentWorkItemWithCompletion(id: string, body: JsonRec
     const payloadIncrement = body.payload_increment && typeof body.payload_increment === "object" && !Array.isArray(body.payload_increment)
       ? body.payload_increment as JsonRecord
       : null;
+    const attemptedPayloadKeys = [...Object.keys(payloadPatch || {}), ...Object.keys(payloadIncrement || {})];
     if (existingPayload.runtime_contract === "fresh_review_v1") {
-      const attemptedKeys = [...Object.keys(payloadPatch || {}), ...Object.keys(payloadIncrement || {})];
-      if (attemptedKeys.some((key) => FRESH_REVIEW_CONTROLLED_PAYLOAD_KEYS.has(key))) {
+      if (attemptedPayloadKeys.some((key) => FRESH_REVIEW_CONTROLLED_PAYLOAD_KEYS.has(key))) {
         throw new Error("fresh_review_controlled_payload_mutation");
       }
+    }
+    if (isScheduledLaunchControlledPayload(existingPayload)
+      && attemptedPayloadKeys.some((key) => YOUTUBE_LAUNCH_CONTROLLED_PAYLOAD_KEYS.has(key))) {
+      throw new Error("youtube_launch_controlled_payload_mutation");
     }
 
     const completionTime = new Date();
@@ -254,14 +276,21 @@ export async function patchAgentWorkItemWithCompletion(id: string, body: JsonRec
         RETURNING ${WORK_ITEM_COLUMNS}`,
       values,
     );
-    const row = updatedResult.rows[0];
+    let row = updatedResult.rows[0];
 
-    await orchestrateWorkItemCompletion(client, {
+    const orchestration = await orchestrateWorkItemCompletion(client, {
       existing,
       updated: row,
       body,
       publicationVerification,
     });
+    if (orchestration.applied) {
+      const refreshed = await client.query(
+        `SELECT ${WORK_ITEM_COLUMNS} FROM public.work_items WHERE id=$1 LIMIT 1`,
+        [id],
+      );
+      if (refreshed.rows[0]) row = refreshed.rows[0];
+    }
 
     const payload = (row.payload || {}) as JsonRecord;
     await client.query(

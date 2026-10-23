@@ -6,12 +6,21 @@ import { AGENT_ROUTING, isRoutedAgent } from "@/lib/agent-routing";
 import { isLocalAuthDisabled } from "@/lib/auth/local";
 import { query, withTransaction } from "@/lib/db/postgres";
 import { buildLoopWakeContext } from "@/lib/loops/execution-instruction";
+import { evaluateYouTubeLaunchActionReadiness } from "@/lib/youtube-launch-state";
 import {
   genericNotifyIdentityMatches,
   isVisualQaLikeWorkItem,
   parseGenericNotifyClassificationIdentity,
 } from "@/lib/work-items/generic-notify-contract";
 import { serializeWorkItemStatusPayload } from "@/lib/work-items/status-payload";
+import {
+  claimExternalDelivery,
+  markExternalDeliveryPreDeliveryFailure,
+} from "@/lib/work-items/external-delivery";
+import {
+  buildScheduledLaunchGateBlockedTransition,
+  nextScheduledLaunchRetryTransition,
+} from "@/lib/work-items/scheduled-launch-runtime";
 
 export const dynamic = "force-dynamic";
 
@@ -70,6 +79,189 @@ type WorkItemRow = {
   payload: Record<string, unknown> | null;
 };
 
+type LaunchReadinessItem = Parameters<typeof evaluateYouTubeLaunchActionReadiness>[0]["item"];
+type LaunchReadinessWorkItem = Parameters<typeof evaluateYouTubeLaunchActionReadiness>[0]["workItem"];
+type LaunchReadinessLocalClient = {
+  query<T extends Record<string, unknown> = Record<string, unknown>>(
+    text: string,
+    params?: unknown[],
+  ): Promise<{ rows: T[] }>;
+};
+
+const GENERIC_NOTIFY_LEASE_VERSION = "generic_notify_lease_v1" as const;
+const GENERIC_NOTIFY_IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+const IMPLEMENTATION_UUID_SOURCE = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}";
+const IMPLEMENTATION_UUID_PATTERN = new RegExp(`^${IMPLEMENTATION_UUID_SOURCE}$`);
+const IMPLEMENTATION_SCHEDULER_SESSION_PATTERN = new RegExp(`^${IMPLEMENTATION_UUID_SOURCE}:attempt-([1-9][0-9]*):${IMPLEMENTATION_UUID_SOURCE}$`);
+
+function isTrustedImplementationDispatchSessionId(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 128) return false;
+  if (IMPLEMENTATION_UUID_PATTERN.test(value)) return true;
+  const schedulerIdentity = IMPLEMENTATION_SCHEDULER_SESSION_PATTERN.exec(value);
+  if (!schedulerIdentity) return false;
+  const attempt = Number(schedulerIdentity[1]);
+  return Number.isSafeInteger(attempt) && attempt > 0;
+}
+
+type GenericNotifyLease = {
+  version: typeof GENERIC_NOTIFY_LEASE_VERSION;
+  key: string;
+  outcome: "leased" | "accepted" | "failed";
+  leased_at: string;
+  expires_at: string;
+  outcome_at: string | null;
+  mode: WakeAgentResult["mode"] | null;
+  session_key: string | null;
+  error: string | null;
+};
+
+function genericNotifyLeaseMs() {
+  const configured = Number(process.env.GENERIC_NOTIFY_LEASE_MS || 60000);
+  return Number.isSafeInteger(configured) && configured >= 1000 && configured <= 3600000
+    ? configured
+    : 60000;
+}
+
+function parseGenericNotifyLease(payload: Record<string, unknown> | null): GenericNotifyLease | null | "invalid" {
+  const value = payload?.generic_notify_lease;
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "invalid";
+  const lease = value as Record<string, unknown>;
+  const outcome = String(lease.outcome);
+  const outcomeAtValid = lease.outcome_at === null
+    || (typeof lease.outcome_at === "string" && Number.isFinite(Date.parse(lease.outcome_at)));
+  const modeValid = lease.mode === null || lease.mode === "hermes_cli_spawn" || lease.mode === "hermes_cli_health";
+  const sessionKeyValid = lease.session_key === null
+    || (typeof lease.session_key === "string" && lease.session_key.length <= 512);
+  const errorValid = lease.error === null || (typeof lease.error === "string" && lease.error.length <= 500);
+  if (lease.version !== GENERIC_NOTIFY_LEASE_VERSION
+      || typeof lease.key !== "string" || !GENERIC_NOTIFY_IDEMPOTENCY_KEY.test(lease.key)
+      || !["leased", "accepted", "failed"].includes(outcome)
+      || typeof lease.leased_at !== "string" || !Number.isFinite(Date.parse(lease.leased_at))
+      || typeof lease.expires_at !== "string" || !Number.isFinite(Date.parse(lease.expires_at))
+      || !outcomeAtValid || !modeValid || !sessionKeyValid || !errorValid
+      || (outcome === "leased" && (lease.outcome_at !== null || lease.mode !== null || lease.error !== null))
+      || (outcome === "accepted" && (lease.outcome_at === null || lease.mode === null || lease.error !== null))
+      || (outcome === "failed" && (lease.outcome_at === null || lease.mode === null || typeof lease.error !== "string"))) {
+    return "invalid";
+  }
+  return lease as GenericNotifyLease;
+}
+
+function genericNotifyReplayBody(item: WorkItemRow, agent: string, lease: GenericNotifyLease) {
+  const accepted = lease.outcome === "accepted";
+  const pending = lease.outcome === "leased";
+  return {
+    ok: accepted,
+    accepted,
+    pending,
+    agent,
+    woke: lease.outcome === "accepted",
+    workItemId: item.id,
+    wakeMode: lease.mode,
+    dispatchCronJobId: null,
+    dispatchCronRunId: null,
+    dispatchSessionId: typeof item.payload?.dispatch_session_id === "string" ? item.payload.dispatch_session_id : null,
+    dispatchSessionKey: lease.session_key,
+    idempotent: true,
+    outcome: lease.outcome,
+    error: lease.error,
+  };
+}
+
+function textValue(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function externalDeliveryKey(payload: Record<string, unknown>) {
+  return textValue(payload.external_delivery_idempotency_key);
+}
+
+function externalDeliveryScope(payload: Record<string, unknown>) {
+  return recordValue(payload.idempotency_scope);
+}
+
+function externalDeliveryInstruction(payload: Record<string, unknown>) {
+  const key = externalDeliveryKey(payload);
+  const claim = recordValue(payload.external_delivery_claim);
+  const token = textValue(claim.claim_token);
+  if (!key || !token) return "";
+  return `\n## REQUIRED: Durable external-delivery contract\nMission Control atomically claimed external delivery key ${key} with claim token ${token}. This key and token are server-owned and immutable. Issue the Community publish or Email provider request at most once, pass ${key} as the provider idempotency key when supported, and never retry an ambiguous/provider-pending request. Before completing, report output.external_delivery = { status: \"accepted\", accepted_at, provider_delivery_id } only after provider acceptance; report { status: \"not_attempted\", failure_class, error } only when no provider request was issued; otherwise report { status: \"ambiguous\", error }.\n`;
+}
+
+function externalDeliveryReplayBody(item: WorkItemRow, agent: string, claim: Awaited<ReturnType<typeof claimExternalDelivery>>) {
+  const accepted = claim.kind === "accepted_replay";
+  return {
+    ok: accepted,
+    accepted,
+    pending: !accepted,
+    agent,
+    woke: false,
+    workItemId: item.id,
+    idempotent: true,
+    externalDeliveryKey: claim.key,
+    externalDeliveryOutcome: claim.status,
+    providerDeliveryId: claim.providerDeliveryId,
+  };
+}
+
+function needsScheduledLaunchReadiness(payload: Record<string, unknown>) {
+  return payload.launch_state_contract === "scheduled_launch_v2"
+    && (payload.requires_preflight_passed === true || payload.requires_live_check_passed === true);
+}
+
+async function checkScheduledLaunchReadiness(input: {
+  useLocalMode: boolean;
+  db: ReturnType<typeof createServiceClient> | null;
+  localClient?: LaunchReadinessLocalClient;
+  item: WorkItemRow;
+  payload: Record<string, unknown>;
+}) {
+  if (!needsScheduledLaunchReadiness(input.payload)) return null;
+  const pipelineItemId = textValue(input.payload.source_video_pipeline_item_id)
+    || textValue(input.payload.pipeline_item_id)
+    || (["pipeline_item", "service"].includes(String(input.item.source_type || "")) ? textValue(input.item.source_id) : null);
+  if (!pipelineItemId) {
+    return { ok: false, failures: ["missing_launch_pipeline_item_id"], remediation: "Recreate or repair the scheduled launch work item payload before dispatch." };
+  }
+
+  let pipelineItem: Record<string, unknown> | null = null;
+  if (input.useLocalMode) {
+    const localQuery = input.localClient?.query.bind(input.localClient) || query;
+    const { rows } = await localQuery<Record<string, unknown>>(
+      `select id,title,status,scheduled_for,published_at,current_url,metadata
+         from public.pipeline_items
+        where id=$1
+        limit 1`,
+      [pipelineItemId],
+    );
+    pipelineItem = rows[0] || null;
+  } else {
+    const { data, error } = await (input.db as ReturnType<typeof createServiceClient>)
+      .from("pipeline_items")
+      .select("id,title,status,scheduled_for,published_at,current_url,metadata")
+      .eq("id", pipelineItemId)
+      .maybeSingle();
+    if (error) {
+      return { ok: false, failures: ["launch_pipeline_item_read_failed"], remediation: error.message };
+    }
+    pipelineItem = data as Record<string, unknown> | null;
+  }
+
+  if (!pipelineItem) {
+    return { ok: false, failures: ["launch_pipeline_item_not_found"], remediation: "Recreate or repair the scheduled launch parent before dispatch." };
+  }
+
+  return evaluateYouTubeLaunchActionReadiness({
+    item: pipelineItem as LaunchReadinessItem,
+    workItem: { ...input.item, payload: input.payload } as LaunchReadinessWorkItem,
+  });
+}
+
 function buildLoopContext(loop: LoopContextRow) {
   const parts: string[] = [];
 
@@ -83,6 +275,11 @@ function buildLoopContext(loop: LoopContextRow) {
 }
 
 function buildWorkItemSessionKey(agentId: string, workItemId: string, payload?: Record<string, unknown> | null) {
+  const genericNotifyLease = parseGenericNotifyLease(payload || null);
+  if (genericNotifyLease && genericNotifyLease !== "invalid") {
+    return `agent:${agentId}:mission-control:work-item:${workItemId}:notify:${genericNotifyLease.key}`;
+  }
+
   const dispatchSessionKey = typeof payload?.dispatch_session_key === "string" ? payload.dispatch_session_key : "";
   if (dispatchSessionKey) return dispatchSessionKey;
 
@@ -225,25 +422,45 @@ async function wakeAgentViaHermesCli(agentId: string, workItemId: string, messag
     "--yolo",
   ];
 
-  try {
-    const child = spawn(hermesBin(), args, {
-      cwd: process.cwd(),
-      detached: true,
-      stdio: "ignore",
-      env: baseCommandEnv({
-        HERMES_MISSION_CONTROL_WORK_ITEM_ID: workItemId,
-        HERMES_MISSION_CONTROL_AGENT_ID: agentId,
-        HERMES_MISSION_CONTROL_SESSION_KEY: sessionKey,
-      }),
-    });
-    child.unref();
-    console.log(`[notify-work-item] spawned Hermes CLI wake pid ${child.pid} for ${agentId} ${workItemId}`);
-    return { ok: true, mode: "hermes_cli_spawn", sessionKey };
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
-    console.error(`[notify-work-item] failed to spawn Hermes CLI wake for ${agentId}:`, error);
-    return { ok: false, mode: "hermes_cli_spawn", sessionKey, error };
-  }
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(hermesBin(), args, {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: "ignore",
+        env: baseCommandEnv({
+          HERMES_MISSION_CONTROL_WORK_ITEM_ID: workItemId,
+          HERMES_MISSION_CONTROL_AGENT_ID: agentId,
+          HERMES_MISSION_CONTROL_SESSION_KEY: sessionKey,
+        }),
+      });
+
+      const onError = (err: Error) => {
+        child.removeListener("spawn", onSpawn);
+        console.error(`[notify-work-item] failed to spawn Hermes CLI wake for ${agentId}:`, err.message);
+        resolve({ ok: false, mode: "hermes_cli_spawn", sessionKey, error: err.message });
+      };
+      const onSpawn = () => {
+        child.removeListener("error", onError);
+        // Detached execution is accepted once the OS has spawned it; do not wait
+        // for the agent to finish. Keep a late error listener so no ChildProcess
+        // error can become an unhandled EventEmitter exception.
+        child.on("error", (err) => {
+          console.error(`[notify-work-item] Hermes CLI wake pid ${child.pid} later errored for ${agentId}:`, err.message);
+        });
+        child.unref();
+        console.log(`[notify-work-item] spawned Hermes CLI wake pid ${child.pid} for ${agentId} ${workItemId}`);
+        resolve({ ok: true, mode: "hermes_cli_spawn", sessionKey });
+      };
+
+      child.once("error", onError);
+      child.once("spawn", onSpawn);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err.message : String(err);
+      console.error(`[notify-work-item] failed to spawn Hermes CLI wake for ${agentId}:`, error);
+      resolve({ ok: false, mode: "hermes_cli_spawn", sessionKey, error });
+    }
+  });
 }
 
 async function wakeAgent(agentId: string, workItemId: string, message: string, workPayload?: Record<string, unknown> | null): Promise<WakeAgentResult> {
@@ -275,13 +492,17 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { workItemId, agent, action, caller, expectedClassificationIdentity } = await request.json();
+  const { workItemId, agent, action, caller, idempotencyKey, expectedClassificationIdentity } = await request.json();
   const isGenericSchedulerCall = caller === "generic_scheduler_v1";
   const schedulerClassificationIdentity = isGenericSchedulerCall
     ? parseGenericNotifyClassificationIdentity(expectedClassificationIdentity)
     : null;
   if (isGenericSchedulerCall && !schedulerClassificationIdentity) {
     return NextResponse.json({ error: "generic_notify_classification_identity_required" }, { status: 400 });
+  }
+  if (isGenericSchedulerCall
+      && (typeof idempotencyKey !== "string" || !GENERIC_NOTIFY_IDEMPOTENCY_KEY.test(idempotencyKey))) {
+    return NextResponse.json({ error: "generic_notify_idempotency_key_required" }, { status: 400 });
   }
 
   if (!isRoutedAgent(agent)) {
@@ -318,20 +539,21 @@ export async function POST(request: NextRequest) {
   if (!item) {
     return NextResponse.json({ error: "work_item not found" }, { status: 404 });
   }
-  if (isVisualQaLikeWorkItem(item)) {
+  if (!isGenericSchedulerCall && isVisualQaLikeWorkItem(item)) {
     return NextResponse.json({ error: "visual_qa_v1 requires dedicated QA claim" }, { status: 409 });
   }
-  if (item.payload?.runtime_contract === "fresh_review_v1" && item.payload?.run_role === "review") {
+  if (!isGenericSchedulerCall
+      && item.payload?.runtime_contract === "fresh_review_v1" && item.payload?.run_role === "review") {
     return NextResponse.json({ error: "fresh_review_v1 requires dedicated reviewer dispatch" }, { status: 409 });
   }
-  if (agent !== item.owner_agent && agent !== item.target_agent_id) {
+  if (!isGenericSchedulerCall && agent !== item.owner_agent && agent !== item.target_agent_id) {
     return NextResponse.json({ error: "notify_agent_identity_mismatch" }, { status: 409 });
   }
 
   // fresh_review_v1 session identity is server-owned. The detached agent never
   // supplies or chooses it; retries of the same immutable work item retain it.
   let workPayload = { ...(item.payload || {}) } as Record<string, unknown>;
-  if (useLocalMode && workPayload.runtime_contract === "fresh_review_v1"
+  if (!isGenericSchedulerCall && useLocalMode && workPayload.runtime_contract === "fresh_review_v1"
       && typeof workPayload.dispatch_session_id !== "string") {
     const dispatchSessionId = randomUUID();
     const assigned = await query<{ payload: Record<string, unknown> }>(
@@ -353,6 +575,43 @@ export async function POST(request: NextRequest) {
       workPayload = refreshed.rows[0]?.payload || workPayload;
       item.payload = workPayload;
     }
+  }
+
+  const preLockDeliveryKey = externalDeliveryKey(workPayload);
+  if (!useLocalMode && !isGenericSchedulerCall && needsScheduledLaunchReadiness(workPayload)) {
+    return NextResponse.json({ error: "scheduled_launch_notify_requires_local_atomic_guard" }, { status: 503 });
+  }
+  const launchReadiness = isGenericSchedulerCall || !useLocalMode
+    ? await checkScheduledLaunchReadiness({ useLocalMode, db, item, payload: workPayload })
+    : null;
+  if (launchReadiness && !launchReadiness.ok) {
+    const blocked = buildScheduledLaunchGateBlockedTransition(workPayload, {
+      now: new Date(),
+      failures: launchReadiness.failures,
+      remediation: launchReadiness.remediation || "Resolve the launch gate failures, rerun preflight, then manually requeue.",
+    });
+    if (useLocalMode) {
+      await withTransaction(async (client) => {
+        await client.query("select id from public.work_items where id=$1 for update", [item!.id]);
+        await client.query(
+          `update public.work_items
+              set status=$2,scheduled_for=null,completed_at=null,payload=$3::jsonb,updated_at=now()
+            where id=$1`,
+          [item!.id, blocked.status, JSON.stringify(blocked.payload)],
+        );
+      });
+    } else {
+      await (db as ReturnType<typeof createServiceClient>)
+        .from("work_items")
+        .update({ status: blocked.status, scheduled_for: null, completed_at: null, payload: blocked.payload, updated_at: new Date().toISOString() })
+        .eq("id", item.id);
+    }
+    return NextResponse.json({
+      error: "youtube_launch_gate_blocked",
+      failures: launchReadiness.failures,
+      remediation: launchReadiness.remediation,
+      deadLettered: true,
+    }, { status: 409 });
   }
 
   const actionLabels: Record<string, string> = {
@@ -459,68 +718,422 @@ Fail it:
 ${failCommand}
 \`\`\``;
 
+  let externalClaim: Awaited<ReturnType<typeof claimExternalDelivery>> | null = null;
+  const deliveryKey = preLockDeliveryKey;
+  if (!isGenericSchedulerCall && useLocalMode) {
+    const deliveryAcquisition = await withTransaction(async (client) => {
+      const locked = await client.query<WorkItemRow>(
+        "select * from public.work_items where id=$1 for update",
+        [item!.id],
+      );
+      const current = locked.rows[0];
+      if (!current || current.status !== "ready") return { error: "external_delivery_work_item_not_ready" as const };
+      const initialUpdatedAt = new Date(item!.updated_at).getTime();
+      const lockedUpdatedAt = new Date(current.updated_at).getTime();
+      if (!Number.isFinite(initialUpdatedAt) || !Number.isFinite(lockedUpdatedAt) || initialUpdatedAt !== lockedUpdatedAt) {
+        return { error: "notify_work_item_changed_before_lock" as const };
+      }
+      const currentPayload = { ...(current.payload || {}) } as Record<string, unknown>;
+      const currentDeliveryKey = externalDeliveryKey(currentPayload);
+      if (currentDeliveryKey !== deliveryKey) {
+        return { error: "external_delivery_identity_changed" as const };
+      }
+      const currentLaunchReadiness = await checkScheduledLaunchReadiness({
+        useLocalMode: true,
+        db,
+        localClient: client,
+        item: current,
+        payload: currentPayload,
+      });
+      if (currentLaunchReadiness && !currentLaunchReadiness.ok) {
+        const blocked = buildScheduledLaunchGateBlockedTransition(currentPayload, {
+          now: new Date(),
+          failures: currentLaunchReadiness.failures,
+          remediation: currentLaunchReadiness.remediation || "Resolve the launch gate failures, rerun preflight, then manually requeue.",
+        });
+        await client.query(
+          `update public.work_items
+              set status=$2,scheduled_for=null,completed_at=null,payload=$3::jsonb,updated_at=now()
+            where id=$1`,
+          [current.id, blocked.status, JSON.stringify(blocked.payload)],
+        );
+        return { gateBlocked: currentLaunchReadiness, current };
+      }
+      if (!currentDeliveryKey) return { claim: null, current, payload: currentPayload };
+      const claim = await claimExternalDelivery(client, {
+        key: currentDeliveryKey,
+        workItemId: current.id,
+        scope: externalDeliveryScope(currentPayload),
+        now: new Date(),
+      });
+      if (claim.kind !== "acquired") return { claim, current };
+      currentPayload.external_delivery_claim = {
+        key: claim.key,
+        claim_token: claim.claimToken,
+        claim_attempt: claim.claimAttempt,
+        status: "pending",
+        claimed_at: new Date().toISOString(),
+      };
+      const updated = await client.query<WorkItemRow>(
+        `update public.work_items set payload=$2::jsonb,updated_at=now()
+          where id=$1 returning *`,
+        [current.id, JSON.stringify(currentPayload)],
+      );
+      return { claim, current: updated.rows[0], payload: currentPayload };
+    });
+    if ("error" in deliveryAcquisition) {
+      return NextResponse.json({ error: deliveryAcquisition.error }, { status: 409 });
+    }
+    if ("gateBlocked" in deliveryAcquisition && deliveryAcquisition.gateBlocked) {
+      const gateBlocked = deliveryAcquisition.gateBlocked;
+      return NextResponse.json({
+        error: "youtube_launch_gate_blocked",
+        failures: gateBlocked.failures,
+        remediation: gateBlocked.remediation,
+        deadLettered: true,
+      }, { status: 409 });
+    }
+    externalClaim = deliveryAcquisition.claim;
+    if (externalClaim && externalClaim.kind !== "acquired") {
+      const replayStatus = externalClaim.kind === "accepted_replay" ? 200 : externalClaim.kind === "scope_conflict" ? 409 : 202;
+      return NextResponse.json(externalDeliveryReplayBody(item, agent, externalClaim), { status: replayStatus });
+    }
+    workPayload = deliveryAcquisition.payload!;
+    item = { ...item, ...deliveryAcquisition.current, payload: workPayload };
+    item.payload = workPayload;
+  }
+
   let wake: WakeAgentResult;
   if (isGenericSchedulerCall) {
     if (!useLocalMode || !schedulerClassificationIdentity) {
       return NextResponse.json({ error: "generic_scheduler_notify_requires_local_atomic_guard" }, { status: 503 });
     }
-    const guarded = await withTransaction(async (client) => {
+
+    // Commit the lease before the external spawn. A retry can therefore replay
+    // the same logical attempt even when the first HTTP response is ambiguous.
+    const acquisition = await withTransaction(async (client) => {
       const currentResult = await client.query<WorkItemRow>(
-        `select id,status,updated_at,source_type,source_id,owner_agent,target_agent_id,payload
+        `select id,status,scheduled_for,updated_at,source_type,source_id,owner_agent,target_agent_id,payload
            from public.work_items
           where id=$1
           for update`,
         [item.id],
       );
       const current = currentResult.rows[0];
-      if (!current || !genericNotifyIdentityMatches(schedulerClassificationIdentity, current)) {
+      if (!current) return { error: "generic_notify_classification_identity_changed" as const };
+
+      // Dedicated QA/reviewer rows are never valid generic work, including
+      // replay attempts carrying a pre-existing generic lease.
+      if (isVisualQaLikeWorkItem(current)) return { error: "generic_notify_visual_qa_rejected" as const };
+      if (current.payload?.runtime_contract === "fresh_review_v1" && current.payload?.run_role === "review") {
+        return { error: "generic_notify_fresh_review_rejected" as const };
+      }
+
+      const existingLease = parseGenericNotifyLease(current.payload);
+      if (existingLease === "invalid") return { error: "generic_notify_lease_invalid" as const };
+      const nowMs = Date.now();
+      if (existingLease && existingLease.key === idempotencyKey
+          && existingLease.outcome !== "leased") {
+        return { replay: existingLease, current };
+      }
+      if (existingLease && Date.parse(existingLease.expires_at) > nowMs) {
+        if (existingLease.key === idempotencyKey) return { replay: existingLease, current };
+        return { error: "generic_notify_lease_active" as const };
+      }
+
+      // Classification is intentionally checked against the pristine locked
+      // row before this endpoint writes its own lease into payload/updated_at.
+      if (!genericNotifyIdentityMatches(schedulerClassificationIdentity, current)) {
         return { error: "generic_notify_classification_identity_changed" as const };
       }
-      if (isVisualQaLikeWorkItem(current)) {
-        return { error: "generic_notify_visual_qa_rejected" as const };
+      if (current.status !== "ready") return { error: "generic_notify_status_not_ready" as const };
+      if ((current.payload as Record<string, unknown> | null)?.dispatch_state === "blocked_live_gate") {
+        return { error: "generic_notify_live_gate_blocked" as const };
       }
       if (agent !== current.owner_agent && agent !== current.target_agent_id) {
         return { error: "notify_agent_identity_mismatch" as const };
       }
-      const guardedWake = await wakeAgent(routing.agentId, item.id, message, workPayload);
-      return { wake: guardedWake };
+      const launchReadiness = await checkScheduledLaunchReadiness({
+        useLocalMode,
+        db,
+        localClient: client,
+        item: current,
+        payload: (current.payload || {}) as Record<string, unknown>,
+      });
+      if (launchReadiness && !launchReadiness.ok) {
+        const blocked = buildScheduledLaunchGateBlockedTransition(current.payload || {}, {
+          now: new Date(),
+          failures: launchReadiness.failures,
+          remediation: launchReadiness.remediation || "Resolve the launch gate failures, rerun preflight, then manually requeue.",
+        });
+        await client.query(
+          `update public.work_items
+              set status=$2,scheduled_for=null,completed_at=null,payload=$3::jsonb,updated_at=now()
+            where id=$1`,
+          [current.id, blocked.status, JSON.stringify(blocked.payload)],
+        );
+        return { gateBlocked: launchReadiness };
+      }
+
+      const payload: Record<string, unknown> = { ...(current.payload || {}) };
+      const currentDeliveryKey = externalDeliveryKey(payload);
+      let deliveryClaim: Awaited<ReturnType<typeof claimExternalDelivery>> | null = null;
+      if (currentDeliveryKey) {
+        deliveryClaim = await claimExternalDelivery(client, {
+          key: currentDeliveryKey,
+          workItemId: current.id,
+          scope: externalDeliveryScope(payload),
+          now: new Date(nowMs),
+        });
+        if (deliveryClaim.kind !== "acquired") {
+          return { externalReplay: deliveryClaim, current };
+        }
+        payload.external_delivery_claim = {
+          key: deliveryClaim.key,
+          claim_token: deliveryClaim.claimToken,
+          claim_attempt: deliveryClaim.claimAttempt,
+          status: "pending",
+          claimed_at: new Date(nowMs).toISOString(),
+        };
+      }
+
+      const leasedAt = new Date(nowMs).toISOString();
+      const lease: GenericNotifyLease = {
+        version: GENERIC_NOTIFY_LEASE_VERSION,
+        key: idempotencyKey,
+        outcome: "leased",
+        leased_at: leasedAt,
+        expires_at: new Date(nowMs + genericNotifyLeaseMs()).toISOString(),
+        outcome_at: null,
+        mode: null,
+        session_key: null,
+        error: null,
+      };
+      // fresh_review_v1 implementation completion requires a server-owned
+      // dispatch identity. Issue it under the same row lock as the lease so
+      // concurrent same-key requests observe and preserve one trusted UUID.
+      if (payload.runtime_contract === "fresh_review_v1"
+          && payload.run_role === "implementation"
+          && !isTrustedImplementationDispatchSessionId(payload.dispatch_session_id)) {
+        payload.dispatch_session_id = randomUUID();
+      }
+      payload.generic_notify_lease = lease;
+      const updated = await client.query<WorkItemRow>(
+        `update public.work_items
+            set payload=$2::jsonb,updated_at=now()
+          where id=$1
+          returning id,status,updated_at,source_type,source_id,owner_agent,target_agent_id,payload`,
+        [current.id, JSON.stringify(payload)],
+      );
+      if (!updated.rows[0]) return { error: "generic_notify_lease_write_failed" as const };
+      return { acquired: true as const, current: updated.rows[0], payload, deliveryClaim };
     });
-    if ("error" in guarded) {
-      return NextResponse.json({ error: guarded.error }, { status: 409 });
+
+    if ("error" in acquisition) {
+      return NextResponse.json({ error: acquisition.error }, { status: 409 });
     }
-    wake = guarded.wake;
-  } else {
+    const gateBlocked = "gateBlocked" in acquisition ? acquisition.gateBlocked : null;
+    if (gateBlocked) {
+      return NextResponse.json({
+        error: "youtube_launch_gate_blocked",
+        failures: gateBlocked.failures,
+        remediation: gateBlocked.remediation,
+      }, { status: 409 });
+    }
+    if ("replay" in acquisition && acquisition.replay) {
+      const replay = acquisition.replay as GenericNotifyLease;
+      const body = genericNotifyReplayBody({ ...item, payload: acquisition.current.payload }, agent, replay);
+      const status = replay.outcome === "failed" ? 503 : replay.outcome === "leased" ? 202 : 200;
+      return NextResponse.json(body, { status });
+    }
+    if ("externalReplay" in acquisition && acquisition.externalReplay) {
+      const replay = acquisition.externalReplay;
+      const status = replay.kind === "accepted_replay" ? 200 : replay.kind === "scope_conflict" ? 409 : 202;
+      return NextResponse.json(externalDeliveryReplayBody(item, agent, replay), { status });
+    }
+    if (!("acquired" in acquisition) || !acquisition.acquired) {
+      return NextResponse.json({ error: "generic_notify_lease_acquire_failed" }, { status: 503 });
+    }
+
+    workPayload = acquisition.payload;
+    item.payload = workPayload;
+    externalClaim = acquisition.deliveryClaim;
+    message += externalDeliveryInstruction(workPayload);
     wake = await wakeAgent(routing.agentId, item.id, message, workPayload);
-  }
-  if (!wake.ok) {
-    let latestStatus: string | null = null;
-    if (useLocalMode) {
-      const { rows } = await query(`select status from public.work_items where id = $1 limit 1`, [item.id]);
-      latestStatus = typeof rows[0]?.status === "string" ? rows[0].status : null;
-    } else {
-      const { data: latestItem } = await (db as ReturnType<typeof createServiceClient>)
-        .from("work_items")
-        .select("status")
-        .eq("id", item.id)
-        .maybeSingle();
-      latestStatus = latestItem?.status || null;
-    }
 
-    // Completion is the only safe success signal after a failed wake. An
-    // in_progress claim can also be a stale broken session, so let the scheduler
-    // surface it instead of hiding the failure as a successful dispatch.
-    if (latestStatus === "done") {
-      console.log(`[notify-work-item] ${agent} wake timed out, but work item is ${latestStatus}; treating as success`);
-      wake = { ...wake, ok: true };
+    const finalized = await withTransaction(async (client) => {
+      const locked = await client.query<WorkItemRow>(
+        `select id,status,scheduled_for,updated_at,source_type,source_id,owner_agent,target_agent_id,payload
+           from public.work_items
+          where id=$1
+          for update`,
+        [item.id],
+      );
+      const current = locked.rows[0];
+      if (!current) return null;
+      const lease = parseGenericNotifyLease(current.payload);
+      if (!lease || lease === "invalid" || lease.key !== idempotencyKey || lease.outcome !== "leased") return null;
+
+      const outcomeAt = new Date().toISOString();
+      const finalizedLease: GenericNotifyLease = {
+        ...lease,
+        outcome: wake.ok ? "accepted" : "failed",
+        outcome_at: outcomeAt,
+        mode: wake.mode,
+        session_key: wake.sessionKey || null,
+        error: wake.ok ? null : (wake.error || "wake_failed").slice(0, 500),
+      };
+      let payload: Record<string, unknown> = {
+        ...(current.payload || {}),
+        generic_notify_lease: finalizedLease,
+      };
+      let nextStatus = current.status;
+      let nextScheduledFor = current.scheduled_for;
+      if (!wake.ok) {
+        const previousWakeFailures = Number(payload.wake_failure_count);
+        payload.wake_failure_count = Number.isSafeInteger(previousWakeFailures) && previousWakeFailures >= 0
+          ? previousWakeFailures + 1
+          : 1;
+        payload.dispatch_failure_reason = finalizedLease.error;
+        payload.dispatch_last_failed_at = outcomeAt;
+
+        const key = externalDeliveryKey(payload);
+        const claim = recordValue(payload.external_delivery_claim);
+        const claimToken = textValue(claim.claim_token);
+        if (key && claimToken) {
+          await markExternalDeliveryPreDeliveryFailure(client, {
+            key,
+            claimToken,
+            workItemId: current.id,
+            failedAt: outcomeAt,
+            error: finalizedLease.error || "runtime_unavailable",
+          });
+          payload.external_delivery_claim = { ...claim, status: "failed_pre_delivery", failed_at: outcomeAt };
+        }
+        if (payload.runtime_retry_contract === "scheduled_launch_v2_retry_v1") {
+          const retry = nextScheduledLaunchRetryTransition(payload, {
+            now: outcomeAt,
+            failureClass: "runtime_unavailable",
+            error: finalizedLease.error || "runtime_unavailable",
+          });
+          payload = retry.payload;
+          nextStatus = retry.status;
+          nextScheduledFor = retry.scheduledFor;
+        }
+      }
+      const updated = await client.query<WorkItemRow>(
+        `update public.work_items
+            set payload=$2::jsonb,status=$3,scheduled_for=$4::timestamptz,
+                completed_at=case when $3='ready' then null else completed_at end,updated_at=now()
+          where id=$1
+          returning id,status,scheduled_for,updated_at,source_type,source_id,owner_agent,target_agent_id,payload`,
+        [current.id, JSON.stringify(payload), nextStatus, nextScheduledFor || null],
+      );
+      return updated.rows[0] || null;
+    });
+
+    if (!finalized) {
+      return NextResponse.json({
+        ok: false,
+        agent,
+        woke: wake.ok,
+        workItemId: item.id,
+        wakeMode: wake.mode,
+        error: "generic_notify_lease_finalize_conflict",
+      }, { status: 503 });
+    }
+    workPayload = finalized.payload || workPayload;
+    item.payload = workPayload;
+  } else {
+    message += externalDeliveryInstruction(workPayload);
+    wake = await wakeAgent(routing.agentId, item.id, message, workPayload);
+    if (!wake.ok) {
+      let latestStatus: string | null = null;
+      if (useLocalMode) {
+        const { rows } = await query(`select status from public.work_items where id = $1 limit 1`, [item.id]);
+        latestStatus = typeof rows[0]?.status === "string" ? rows[0].status : null;
+      } else {
+        const { data: latestItem } = await (db as ReturnType<typeof createServiceClient>)
+          .from("work_items")
+          .select("status")
+          .eq("id", item.id)
+          .maybeSingle();
+        latestStatus = latestItem?.status || null;
+      }
+
+      if (latestStatus === "done") {
+        console.log(`[notify-work-item] ${agent} wake timed out, but work item is ${latestStatus}; treating as success`);
+        wake = { ...wake, ok: true };
+      }
     }
   }
 
+  if (!wake.ok && !isGenericSchedulerCall
+      && (externalDeliveryKey(workPayload) || workPayload.runtime_retry_contract === "scheduled_launch_v2_retry_v1")) {
+    if (!useLocalMode) {
+      return NextResponse.json({ error: "scheduled_launch_retry_requires_local_atomic_guard" }, { status: 503 });
+    }
+    const failedAt = new Date().toISOString();
+    await withTransaction(async (client) => {
+      const locked = await client.query<WorkItemRow>("select * from public.work_items where id=$1 for update", [item.id]);
+      const current = locked.rows[0];
+      if (!current) return;
+      let payload = { ...(current.payload || {}) } as Record<string, unknown>;
+      const key = externalDeliveryKey(payload);
+      const claim = recordValue(payload.external_delivery_claim);
+      const claimToken = textValue(claim.claim_token);
+      if (key && claimToken) {
+        await markExternalDeliveryPreDeliveryFailure(client, {
+          key,
+          claimToken,
+          workItemId: current.id,
+          failedAt,
+          error: wake.error || "runtime_unavailable",
+        });
+        payload.external_delivery_claim = { ...claim, status: "failed_pre_delivery", failed_at: failedAt };
+      }
+      let status = current.status;
+      let scheduledFor = current.scheduled_for;
+      if (payload.runtime_retry_contract === "scheduled_launch_v2_retry_v1") {
+        const retry = nextScheduledLaunchRetryTransition(payload, {
+          now: failedAt,
+          failureClass: "runtime_unavailable",
+          error: wake.error || "runtime_unavailable",
+        });
+        payload = retry.payload;
+        status = retry.status;
+        scheduledFor = retry.scheduledFor;
+      }
+      await client.query(
+        `update public.work_items
+            set payload=$2::jsonb,status=$3,scheduled_for=$4::timestamptz,
+                completed_at=case when $3='ready' then null else completed_at end,updated_at=now()
+          where id=$1`,
+        [current.id, JSON.stringify(payload), status, scheduledFor || null],
+      );
+      workPayload = payload;
+      item.payload = payload;
+    });
+  }
+
   if (!wake.ok) {
-    return NextResponse.json({ ok: false, agent, woke: false, workItemId: item.id, wakeMode: wake.mode, error: wake.error || null }, { status: 503 });
+    return NextResponse.json({
+      ok: false,
+      accepted: false,
+      pending: false,
+      agent,
+      woke: false,
+      workItemId: item.id,
+      wakeMode: wake.mode,
+      dispatchSessionKey: wake.sessionKey || null,
+      idempotent: false,
+      outcome: isGenericSchedulerCall ? "failed" : undefined,
+      error: wake.error || null,
+    }, { status: 503 });
   }
 
   const webhookUrl = process.env.DISCORD_TASK_ROUTER_WEBHOOK;
-  const suppressTaskRouterWebhook = workPayload.suppress_task_router_webhook === true;
+  const suppressTaskRouterWebhook = workPayload.suppress_task_router_webhook === true || workPayload.notify_project_thread === false;
   if (webhookUrl && !suppressTaskRouterWebhook) {
     try {
       await fetch(webhookUrl, {
@@ -537,6 +1150,8 @@ ${failCommand}
 
   return NextResponse.json({
     ok: true,
+    accepted: true,
+    pending: false,
     agent,
     woke: wake.ok,
     workItemId: item.id,
@@ -545,5 +1160,7 @@ ${failCommand}
     dispatchCronRunId: null,
     dispatchSessionId: typeof workPayload.dispatch_session_id === "string" ? workPayload.dispatch_session_id : null,
     dispatchSessionKey: wake.sessionKey || null,
+    idempotent: false,
+    outcome: isGenericSchedulerCall ? "accepted" : undefined,
   });
 }
