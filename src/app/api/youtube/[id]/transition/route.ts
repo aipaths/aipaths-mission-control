@@ -133,6 +133,13 @@ function createSnapshotInstruction(input: {
   ].join("\n");
 }
 
+// GON-502: Mission Control registra el estado; las tareas viven en Linear.
+// Los work items de efectos de etapa (automatización, snapshots, email de anuncio)
+// quedan apagados salvo que se active el flag explícitamente.
+function stageEffectsEnabled(): boolean {
+  return process.env.MC_STAGE_TRANSITION_WORK_ITEMS === "1";
+}
+
 async function createPublishedSnapshotWorkItems(input: {
   db?: ReturnType<typeof createServiceClient>;
   localMode?: boolean;
@@ -717,7 +724,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           return { kind: "stale" as const };
         }
 
-        const stageAutomationWorkItem = await createStageAutomationWorkItem({
+        const stageAutomationWorkItem = !stageEffectsEnabled() ? null : await createStageAutomationWorkItem({
           localMode: true,
           localClient: client,
           pipelineItemId: String(lockedItem.id),
@@ -728,7 +735,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           note,
           existingSummary,
         });
-        const snapshotWorkItems = requestedStage === "published" && (youtubeUrl || videoId)
+        const snapshotWorkItems = stageEffectsEnabled() && requestedStage === "published" && (youtubeUrl || videoId)
           ? await createPublishedSnapshotWorkItems({
               localMode: true,
               localClient: client,
@@ -741,7 +748,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               videoId,
             })
           : [];
-        const emailAnnouncementWorkItem = requestedStage === "published"
+        const emailAnnouncementWorkItem = stageEffectsEnabled() && requestedStage === "published"
           ? await createVideoAnnouncementEmailWorkItem({
               localMode: true,
               localClient: client,
@@ -791,17 +798,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     })().catch(() => null);
     if (!updated) return NextResponse.json({ error: "Failed to update stage" }, { status: 500 });
 
-    const stageAutomationWorkItem = await createStageAutomationWorkItem({
+    const stageAutomationWorkItem = !stageEffectsEnabled() ? null : await createStageAutomationWorkItem({
       db: db!, localMode: false, pipelineItemId: item.id, title: item.title, stage: requestedStage,
       priority: item.priority, requestedBy: actorIdentity, note, existingSummary,
     });
-    const snapshotWorkItems = requestedStage === "published" && (youtubeUrl || videoId)
+    const snapshotWorkItems = stageEffectsEnabled() && requestedStage === "published" && (youtubeUrl || videoId)
       ? await createPublishedSnapshotWorkItems({
           db: db!, localMode: false, pipelineItemId: item.id, title: item.title, priority: item.priority,
           requestedBy: actorIdentity, publishedAt: now, youtubeUrl, videoId,
         })
       : [];
-    const emailAnnouncementWorkItem = requestedStage === "published"
+    const emailAnnouncementWorkItem = stageEffectsEnabled() && requestedStage === "published"
       ? await createVideoAnnouncementEmailWorkItem({
           db: db!, localMode: false, videoPipelineItemId: item.id, title: item.title, priority: item.priority,
           requestedBy: actorIdentity, youtubeUrl, videoId, summary: existingSummary,
